@@ -241,6 +241,7 @@ class MemoryUpdateResult:
         self.written_uris: List[str] = []
         self.edited_uris: List[str] = []
         self.deleted_uris: List[str] = []
+        self.overview_directories: Dict[str, str] = {}
         self.errors: List[Tuple[str, Exception]] = []
 
     def add_written(self, uri: str) -> None:
@@ -251,6 +252,9 @@ class MemoryUpdateResult:
 
     def add_deleted(self, uri: str) -> None:
         self.deleted_uris.append(uri)
+
+    def add_overview_directory(self, directory: str, memory_type: str) -> None:
+        self.overview_directories[directory] = memory_type
 
     def add_error(self, uri: str, error: Exception) -> None:
         self.errors.append((uri, error))
@@ -263,6 +267,7 @@ class MemoryUpdateResult:
             f"Written: {len(self.written_uris)}, "
             f"Edited: {len(self.edited_uris)}, "
             f"Deleted: {len(self.deleted_uris)}, "
+            f"Overviews: {len(self.overview_directories)}, "
             f"Errors: {len(self.errors)}"
         )
 
@@ -412,7 +417,9 @@ class MemoryUpdater:
             )
 
         for dir, memory_type in dirs.items():
-            await self.generate_overview(memory_type, dir, ctx, extract_context)
+            schema = self._registry.get(memory_type)
+            if schema and schema.overview_template:
+                result.add_overview_directory(dir, memory_type)
 
         return result
 

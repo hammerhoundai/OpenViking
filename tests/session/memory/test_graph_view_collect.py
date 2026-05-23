@@ -37,7 +37,7 @@ async def test_collect_graph_data_preserves_markdown_links_in_content_full():
     assert len(nodes) == 1
     assert (
         nodes[0]["content_full"]
-        == "2023-08-22 (Tuesday) ChatLog:\n[Calvin]: I scored a deal with [Frank Ocean](../../../../entities/personal/calvin.md)!"
+        == "2023-08-22 (Tuesday) ChatLog:\n[Calvin]: I scored a deal with [[Frank](../../../../entities/personal/calvin.md) Ocean](../../../../entities/personal/calvin.md)!"
     )
     assert edges == []
 
@@ -69,7 +69,9 @@ async def test_collect_graph_data_includes_content_preview():
 
     mock_fs = MagicMock()
     mock_fs.tree = AsyncMock(
-        return_value=[_file_entry("viking://agent/demo/memories/experiences/a.md", "experiences/a.md")]
+        return_value=[
+            _file_entry("viking://agent/demo/memories/experiences/a.md", "experiences/a.md")
+        ]
     )
     mock_fs.read_file = AsyncMock(return_value=content)
 
@@ -184,9 +186,7 @@ async def test_collect_graph_data_drops_edges_to_unloaded_external_nodes():
     child_content = f"""Blue\n\n<!-- MEMORY_FIELDS\n{{\"memory_type\": \"preferences\", \"links\": [{{\"to_uri\": \"{external_profile_uri}\", \"link_type\": \"belongs_to\"}}]}}\n-->"""
 
     mock_fs = MagicMock()
-    mock_fs.tree = AsyncMock(
-        return_value=[_file_entry(child_uri, "preferences/color.md")]
-    )
+    mock_fs.tree = AsyncMock(return_value=[_file_entry(child_uri, "preferences/color.md")])
     mock_fs.read_file = AsyncMock(return_value=child_content)
 
     graph = MemoryGraph(viking_fs=mock_fs)

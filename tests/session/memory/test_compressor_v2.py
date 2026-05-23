@@ -15,7 +15,6 @@ import pytest
 
 from openviking.message import Message, TextPart
 from openviking.server.identity import RequestContext, Role
-from openviking.session import compressor_v2 as compressor_v2_module
 from openviking.session.compressor_v2 import SessionCompressorV2
 from openviking.session.memory.dataclass import MemoryField, MemoryFile, MemoryTypeSchema
 from openviking.session.memory.extract_loop import ExtractLoop
@@ -24,7 +23,6 @@ from openviking.session.memory.memory_updater import ExtractContext, MemoryUpdat
 from openviking.session.memory.merge_op import FieldType, MergeOp
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking_cli.session.user_id import UserIdentifier
-from openviking_cli.utils.config import get_openviking_config, initialize_openviking_config
 
 # Let openviking logger propagate to pytest
 for logger_name in ["openviking", "openviking.session.memory"]:
@@ -283,170 +281,91 @@ class TestCompressorV2:
     """Tests for SessionCompressorV2."""
 
     @pytest.mark.asyncio
-    async def test_memory_lock_retry_logging_is_throttled(self, monkeypatch):
-        warnings = []
-        debug_logs = []
-        monkeypatch.setattr(compressor_v2_module.logger, "warning", warnings.append)
-        monkeypatch.setattr(compressor_v2_module.logger, "debug", debug_logs.append)
-
-        last_warning_at = compressor_v2_module._log_memory_lock_retry(
-            retry_count=1,
-            max_retries=0,
-            last_warning_at=0.0,
-        )
-        compressor_v2_module._log_memory_lock_retry(
-            retry_count=2,
-            max_retries=0,
-            last_warning_at=last_warning_at,
-        )
-
-        assert len(warnings) == 1
-        assert "attempt=1" in warnings[0]
-        assert debug_logs == []
-
-    @pytest.mark.asyncio
     async def test_extract_long_term_memories_includes_latest_archive_overview(self):
-        """Latest archive overview should be prepended to the v2 conversation context."""
+        """latest_archive_overview should be forwarded when building the ReAct orchestrator."""
         compressor = SessionCompressorV2(vikingdb=None)
         user = UserIdentifier.the_default_user()
         ctx = RequestContext(user=user, role=Role.ROOT)
         messages = [Message.create_user("Current task")]
+        captured: Dict[str, Any] = {}
+        dummy_registry = SimpleNamespace(initialize_memory_files=AsyncMock())
 
         class DummyOrchestrator:
-            registry = object()
-
-            @property
-            def context_provider(self):
-                # 返回一个 mock provider
-                class DummyProvider:
-                    def get_memory_schemas(self, ctx):
-                        return []
-
-                return DummyProvider()
+            _transaction_handle = None
 
             async def run(self):
-                # 捕获最终的消息列表
-                return (
-                    SimpleNamespace(
-                        write_uris=[],
-                        edit_uris=[],
-                        delete_uris=[],
-                    ),
-                    [],
-                )
+                return None, []
 
-        class DummyUpdater:
-            async def apply_operations(self, operations, ctx, registry=None):
-                return SimpleNamespace(
-                    written_uris=[],
-                    edited_uris=[],
-                    deleted_uris=[],
-                    errors=[],
-                )
+        def create_react(**kwargs):
+            captured["latest_archive_overview"] = kwargs["latest_archive_overview"]
+            return DummyOrchestrator()
 
-        compressor._get_or_create_react = lambda ctx=None: DummyOrchestrator()
-        compressor._get_or_create_updater = lambda transaction_handle=None: DummyUpdater()
-
-        result = await compressor.extract_long_term_memories(
-            messages=messages,
-            user=user,
-            session_id="test-session-v2",
-            ctx=ctx,
-            latest_archive_overview="LATEST OVERVIEW",
-        )
+        with (
+            patch("openviking.storage.viking_fs.get_viking_fs", return_value=None),
+            patch("openviking.storage.transaction.init_lock_manager"),
+            patch("openviking.storage.transaction.get_lock_manager", return_value=None),
+            patch(
+                "openviking.session.memory.memory_type_registry.create_default_registry",
+                return_value=dummy_registry,
+            ),
+            patch.object(compressor, "_get_or_create_react", side_effect=create_react),
+        ):
+            result = await compressor.extract_long_term_memories(
+                messages=messages,
+                user=user,
+                session_id="test-session-v2",
+                ctx=ctx,
+                latest_archive_overview="LATEST OVERVIEW",
+            )
 
         assert result == []
-        # Note: latest_archive_overview 功能已移除，测试需要更新
+        assert captured["latest_archive_overview"] == "LATEST OVERVIEW"
 
-    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_extract_long_term_memories(self):
-        """
-        Test SessionCompressorV2.extract_long_term_memories().
-
-        Uses:
-        - MockVikingFS
-        - REAL VLM (from config)
-        """
-        # Initialize config
-        initialize_openviking_config()
-        config = get_openviking_config()
-        logger.info(f"Using config with memory.version = {config.memory.version}")
-
-        # Get real VLM instance
-        vlm = config.vlm.get_vlm_instance()
-        logger.info(f"Using VLM: {vlm}")
-
-        # Create user and context
+        compressor = SessionCompressorV2(vikingdb=None)
         user = UserIdentifier.the_default_user()
         ctx = RequestContext(user=user, role=Role.ROOT)
-
-        # Create mock VikingFS
-        viking_fs = MockVikingFS()
-
-        # Note: SessionCompressorV2 doesn't actually use vikingdb parameter
-        vikingdb = None
-
-        # Create test conversation
         messages = create_test_conversation()
+        memory_uri = "viking://user/default/memories/profile.md"
+        dummy_registry = SimpleNamespace(initialize_memory_files=AsyncMock())
+        dummy_orchestrator = SimpleNamespace(
+            _transaction_handle=None,
+            run=AsyncMock(
+                return_value=(
+                    SimpleNamespace(upsert_operations=[], delete_file_contents=[], errors=[]),
+                    [],
+                )
+            ),
+        )
 
-        # Format conversation for display
-        conversation_str = "\n".join([f"[{msg.role}]: {msg.content}" for msg in messages])
+        class DummyUpdater:
+            async def apply_operations(self, operations, ctx, **kwargs):
+                result = MemoryUpdateResult()
+                result.written_uris = [memory_uri]
+                return result
 
-        print("=" * 80)
-        print("SessionCompressorV2 TEST")
-        print("=" * 80)
-        print(f"\nConversation ({len(messages)} messages):")
-        print("-" * 80)
-        print(conversation_str[:1000] + "..." if len(conversation_str) > 1000 else conversation_str)
-        print("-" * 80)
+        with (
+            patch("openviking.storage.viking_fs.get_viking_fs", return_value=None),
+            patch("openviking.storage.transaction.init_lock_manager"),
+            patch("openviking.storage.transaction.get_lock_manager", return_value=None),
+            patch(
+                "openviking.session.memory.memory_type_registry.create_default_registry",
+                return_value=dummy_registry,
+            ),
+            patch.object(compressor, "_get_or_create_react", return_value=dummy_orchestrator),
+            patch.object(compressor, "_get_or_create_updater", return_value=DummyUpdater()),
+        ):
+            memories = await compressor.extract_long_term_memories(
+                messages=messages,
+                user=user,
+                session_id="test-session-v2",
+                ctx=ctx,
+                strict_extract_errors=True,
+            )
 
-        # Create SessionCompressorV2
-        compressor = SessionCompressorV2(vikingdb=vikingdb)
-
-        # Take snapshot before running
-        viking_fs.snapshot()
-
-        # Patch get_viking_fs() to return our mock
-        # Need to patch it in all the places it's used
-        with patch("openviking.session.memory.extract_loop.get_viking_fs", return_value=viking_fs):
-            with patch(
-                "openviking.session.memory.memory_updater.get_viking_fs", return_value=viking_fs
-            ):
-                with patch(
-                    "openviking.session.compressor_v2.get_viking_fs", return_value=viking_fs
-                ):
-                    # Actually call extract_long_term_memories()
-                    logger.info("Calling SessionCompressorV2.extract_long_term_memories()...")
-                    memories = await compressor.extract_long_term_memories(
-                        messages=messages,
-                        user=user,
-                        session_id="test-session-v2",
-                        ctx=ctx,
-                        strict_extract_errors=True,
-                    )
-
-        # Verify results
-        print("\n" + "=" * 80)
-        print("TEST RESULTS")
-        print("=" * 80)
-        print(f"Returned memories list length: {len(memories)}")
-        print("Note: v2 returns empty list because it writes directly to storage")
-        print("=" * 80)
-
-        # Check what changed
-        diff = viking_fs.diff_since_snapshot()
-        print("\nChanges detected:")
-        print(f"  Added: {len(diff['added'])} files")
-        print(f"  Modified: {len(diff['modified'])} files")
-        print(f"  Deleted: {len(diff['deleted'])} files")
-
-        # The list can be empty - v2 writes directly to storage
-        # The important thing is that it didn't throw an exception
-        assert memories is not None
-        assert isinstance(memories, list)
-
-        logger.info("Test completed successfully!")
+        assert [context.uri for context in memories] == [memory_uri]
+        dummy_registry.initialize_memory_files.assert_awaited_once_with(ctx)
 
     @pytest.mark.asyncio
     async def test_extract_long_term_memories_logs_agfs_fallback_at_debug(self):
@@ -486,77 +405,54 @@ class TestCompressorV2:
 
     @pytest.mark.asyncio
     async def test_v2_lock_acquire_waits_without_retry_loop(self):
-        """v2 memory extraction should delegate waiting to lock manager without local retries."""
+        """v2 long-term extraction should hand the transaction handle to the orchestrator without prelocking."""
         compressor = SessionCompressorV2(vikingdb=None)
         user = UserIdentifier.the_default_user()
         ctx = RequestContext(user=user, role=Role.ROOT)
         messages = [Message.create_user("test")]
+        events: List[str] = []
+        main_handle = SimpleNamespace(id="main-handle", locks=[])
+        dummy_registry = SimpleNamespace(initialize_memory_files=AsyncMock())
 
-        class FixedSchema:
-            directory = "viking://user/{{ user_space }}/memories"
-            filename_template = "profile.md"
-
-            def filename_has_variables(self):
-                return False
-
-        class VariableSchema:
-            directory = "viking://user/{{ user_space }}/memories/events"
-            filename_template = "{{ event_name }}.md"
-
-            def filename_has_variables(self):
-                return True
-
-        class DummyProvider:
-            def get_memory_schemas(self, _ctx):
-                return [FixedSchema(), VariableSchema()]
-
-            def _get_registry(self):
-                return object()
+        class FakeVikingFS:
+            agfs = object()
 
         class DummyOrchestrator:
-            context_provider = DummyProvider()
+            def __init__(self):
+                self._transaction_handle = None
 
             async def run(self):
-                return (
-                    SimpleNamespace(
-                        write_uris=[],
-                        edit_uris=[],
-                        delete_uris=[],
-                    ),
-                    [],
-                )
+                assert self._transaction_handle is main_handle
+                events.append("run")
+                return None, []
+
+        async def release(handle):
+            events.append(f"release:{handle.id}")
 
         lock_manager = SimpleNamespace(
-            create_handle=lambda: object(),
-            acquire_exact_tree_batch=AsyncMock(return_value=False),
-            release=AsyncMock(),
+            create_handle=lambda: main_handle,
+            acquire_exact_tree_batch=AsyncMock(side_effect=AssertionError("unexpected prelock")),
+            release=AsyncMock(side_effect=release),
         )
 
         with (
-            patch("openviking.session.compressor_v2.get_viking_fs", return_value=MockVikingFS()),
+            patch("openviking.storage.viking_fs.get_viking_fs", return_value=FakeVikingFS()),
             patch("openviking.storage.transaction.init_lock_manager"),
             patch("openviking.storage.transaction.get_lock_manager", return_value=lock_manager),
             patch(
                 "openviking.session.memory.memory_type_registry.create_default_registry",
-                return_value=SimpleNamespace(initialize_memory_files=AsyncMock()),
+                return_value=dummy_registry,
             ),
             patch.object(compressor, "_get_or_create_react", return_value=DummyOrchestrator()),
         ):
-            initialize_openviking_config()
-            config = get_openviking_config()
-            config.memory.v2_lock_max_retries = 2
-            config.memory.v2_lock_retry_interval_seconds = 0.0
             result = await compressor.extract_long_term_memories(
                 messages=messages,
                 ctx=ctx,
-                strict_extract_errors=False,
+                strict_extract_errors=True,
             )
 
         assert result == []
-        assert lock_manager.acquire_exact_tree_batch.await_count == 2
-        _, kwargs = lock_manager.acquire_exact_tree_batch.await_args
-        assert kwargs["exact_paths"] == ["/local/default/user/default/memories/profile.md"]
-        assert kwargs["tree_paths"] == ["/local/default/user/default/memories/events"]
+        assert events == ["run", "release:main-handle"]
 
     @pytest.mark.asyncio
     async def test_extract_phase_runs_post_apply_before_lock_release(self):
@@ -603,17 +499,22 @@ class TestCompressorV2:
             ),
         )
         handle = SimpleNamespace(id="handle-1", locks=[])
-
-        async def acquire_exact_tree_batch(*args, **kwargs):
-            events.append("acquire")
-            return True
+        split_result = (
+            SimpleNamespace(
+                upsert_operations=[SimpleNamespace()],
+                delete_file_contents=[],
+                errors=[],
+            ),
+            SimpleNamespace(upsert_operations=[]),
+            [],
+        )
 
         async def release(_handle):
             events.append("release")
 
         lock_manager = SimpleNamespace(
             create_handle=lambda: handle,
-            acquire_exact_tree_batch=AsyncMock(side_effect=acquire_exact_tree_batch),
+            acquire_exact_tree_batch=AsyncMock(side_effect=AssertionError("unexpected prelock")),
             release=AsyncMock(side_effect=release),
         )
 
@@ -634,6 +535,8 @@ class TestCompressorV2:
             patch("openviking.storage.transaction.init_lock_manager"),
             patch("openviking.storage.transaction.get_lock_manager", return_value=lock_manager),
             patch.object(compressor, "_get_or_create_updater", return_value=DummyUpdater()),
+            patch.object(compressor, "_resolve_supersedes", AsyncMock(return_value={})),
+            patch.object(compressor, "_split_operations_by_memory_type", return_value=split_result),
         ):
             result = await compressor._run_extract_phase(
                 provider=DummyProvider(),
@@ -645,7 +548,7 @@ class TestCompressorV2:
             )
 
         assert result[0] == ["viking://agent/default/memories/experiences/debug.md"]
-        assert events == ["acquire", "apply", "post_apply", "release"]
+        assert events == ["apply", "post_apply", "release"]
 
     @pytest.mark.asyncio
     async def test_append_trajectories_uses_exact_lock(self):

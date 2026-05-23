@@ -10,11 +10,12 @@ No tool calls — all context is prefetched. Top-3 candidates also include their
 source_trajectories as grounding material.
 """
 
-import jinja2
 from typing import Any, Dict, List, Optional
 
+import jinja2
+
 from openviking.core.namespace import to_agent_space, to_user_space
-from openviking.server.identity import RequestContext, ToolContext
+from openviking.server.identity import RequestContext
 from openviking.session.memory.dataclass import MemoryFile
 from openviking.session.memory.session_extract_context_provider import (
     SessionExtractContextProvider,
@@ -137,6 +138,7 @@ All memory content must be written in {output_language}.
                 result["content"] = mf.content
                 result["uri"] = uri
                 results.append(result)
+                self._memory_file_tracker.mark_read(uri)
             except Exception as e:
                 tracer.error(f"Failed to read source trajectory {uri}: {e}")
         return results
@@ -194,6 +196,7 @@ All memory content must be written in {output_language}.
                     tracer.error(f"Failed to list experiences in {experience_dir}: {e}")
 
         prefetch_messages: List[Dict[str, Any]] = [self._build_conversation_message()]
+        self._memory_file_tracker.track_many(candidate_uris)
         add_tool_call_pair_to_messages(
             messages=prefetch_messages,
             call_id="new-trajectory",

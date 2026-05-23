@@ -16,6 +16,7 @@ from openviking.prompts.manager import PromptManager
 from openviking.server.identity import RequestContext, ToolContext
 from openviking.session.memory.core import ExtractContextProvider
 from openviking.session.memory.dataclass import MemoryFile
+from openviking.session.memory.memory_file_tracker import MemoryFileTracker
 from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler, RoleScope
 from openviking.session.memory.memory_type_registry import (
     MemoryTypeRegistry,
@@ -63,6 +64,7 @@ class SessionExtractContextProvider(ExtractContextProvider):
         self._extract_context = None  # 缓存 ExtractContext 实例
         self._isolation_handler = isolation_handler
         self._read_file_contents: Dict[str, MemoryFile] = {}
+        self._memory_file_tracker = MemoryFileTracker()
         # 读取 eager_prefetch 配置
         config = get_openviking_config()
         self._eager_prefetch = config.memory.eager_prefetch if config.memory else False
@@ -75,6 +77,10 @@ class SessionExtractContextProvider(ExtractContextProvider):
     @property
     def read_file_contents(self) -> Dict[str, MemoryFile]:
         return self._read_file_contents
+
+    @property
+    def memory_file_tracker(self) -> MemoryFileTracker:
+        return self._memory_file_tracker
 
     def get_conversation_text(self) -> str:
         """Get the full conversation text for match_text validation."""
@@ -312,17 +318,36 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
 
         return self._truncate_prefetch_query_text(query, _PREFETCH_SEARCH_QUERY_MAX_CHARS)
 
-    def create_tool_context(self, default_search_uris=[]):
+    def create_tool_context(self, default_search_uris: Optional[List[str]] = None):
         extract_context = self.get_extract_context()
         tool_ctx = ToolContext(
             viking_fs=self._viking_fs,
             request_ctx=self._ctx,
             transaction_handle=self._transaction_handle,
-            default_search_uris=default_search_uris,
+            default_search_uris=default_search_uris or [],
             read_file_contents=self._read_file_contents,
             page_id_map=extract_context.page_id_map,
         )
         return tool_ctx
+
+    @staticmethod
+    def _extract_uris_from_search_result(result: Any) -> List[str]:
+        if isinstance(result, list):
+            return [
+                item.get("uri", "") for item in result if isinstance(item, dict) and item.get("uri")
+            ]
+        if isinstance(result, dict) and "memories" in result:
+            return [
+                item.get("uri", "")
+                for item in result.get("memories", [])
+                if isinstance(item, dict) and item.get("uri")
+            ]
+        return []
+
+    def _track_search_result(self, result: Any) -> List[str]:
+        uris = self._extract_uris_from_search_result(result)
+        self._memory_file_tracker.track_many(uris)
+        return uris
 
     async def read_file(self, uri: str) -> Optional[Dict]:
         """Read a file via MemoryReadTool (auto-registers page_id, fills read_file_contents)."""
@@ -334,6 +359,7 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
             if isinstance(result, dict) and "error" in result:
                 tracer.info(f"Failed to read {uri}: {result['error']}")
                 return None
+            self._memory_file_tracker.mark_read(uri)
             return result
         except Exception as e:
             tracer.error(f"Failed to read {uri}: {e}")
@@ -353,11 +379,7 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
                 query=query,
                 limit=limit,
             )
-            if isinstance(result, list):
-                return [m.get("uri", "") for m in result if m.get("uri")]
-            elif isinstance(result, dict) and "memories" in result:
-                return [m.get("uri", "") for m in result.get("memories", []) if m.get("uri")]
-            return []
+            return self._track_search_result(result)
         except Exception as e:
             tracer.error(f"Failed to search: {e}")
             return []
@@ -500,6 +522,10 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
             return {"error": f"Unknown tool: {tool_call.name}"}
         tracer.info(f"tool_call.arguments={tool_call.arguments}")
         result = await tool.execute(self.create_tool_context(), **tool_call.arguments)
+        if tool_call.name == "read" and not (isinstance(result, dict) and "error" in result):
+            self._memory_file_tracker.mark_read(tool_call.arguments.get("uri", ""))
+        elif tool_call.name == "search":
+            self._track_search_result(result)
         return result
 
     def get_tools(self) -> List[str]:
@@ -525,9 +551,7 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
             custom_dir = config.memory.custom_templates_dir
             self._schema_directories = [memory_templates_dir]
             if getattr(config.memory, "experimental_memory_switch", False):
-                experimental_memory_dir = os.path.join(
-                    memory_templates_dir, "experimental_memory"
-                )
+                experimental_memory_dir = os.path.join(memory_templates_dir, "experimental_memory")
                 if os.path.exists(experimental_memory_dir):
                     self._schema_directories.append(experimental_memory_dir)
             if custom_dir:

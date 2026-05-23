@@ -7,16 +7,11 @@ Uses the new Memory Templating System with ReAct orchestrator.
 Maintains the same interface as compressor.py for backward compatibility.
 """
 
-import asyncio
 import json
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from openviking.core.context import Context
-from openviking.core.namespace import (
-    to_agent_space,
-    to_user_space,
-)
 from openviking.message import Message
 from openviking.server.identity import RequestContext
 from openviking.session.memory import ExtractLoop, MemoryUpdater
@@ -25,7 +20,6 @@ from openviking.session.memory.memory_isolation_handler import MemoryIsolationHa
 from openviking.session.memory.memory_updater import ExtractContext, MemoryUpdateResult
 from openviking.session.memory.utils.json_parser import JsonUtils
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
-from openviking.session.memory.utils.uri import render_template
 from openviking.session.skill import SkillOperationUpdater, dedup_session_skill_operations
 from openviking.session.skill.session_skill_context_provider import SESSION_SKILL_MEMORY_TYPE
 from openviking.storage import VikingDBManager
@@ -39,82 +33,8 @@ from openviking_cli.utils.config import get_openviking_config
 logger = get_logger(__name__)
 
 MAX_SOURCE_TRAJECTORIES = 5  # keep only the most recent N trajectory URIs per experience
-_MEMORY_LOCK_RETRY_WARNING_INTERVAL_SECONDS = 10.0
 
 ExtractPostApply = Callable[[MemoryUpdateResult, Dict[str, List[str]], Any], Awaitable[None]]
-
-
-def _filename_has_variables(schema: Any) -> bool:
-    checker = getattr(schema, "filename_has_variables", None)
-    if callable(checker):
-        return bool(checker())
-    filename_template = getattr(schema, "filename_template", "") or ""
-    return "{{" in filename_template and "}}" in filename_template
-
-
-def _append_unique(paths: list[str], path: str) -> None:
-    if path and path not in paths:
-        paths.append(path)
-
-
-def _log_memory_lock_retry(
-    *,
-    retry_count: int,
-    max_retries: int,
-    last_warning_at: float,
-    phase_label: str = "",
-) -> float:
-    now = asyncio.get_running_loop().time()
-    max_label = max_retries or "unlimited"
-    prefix = f"[{phase_label}] " if phase_label else ""
-    message = (
-        f"{prefix}Failed to acquire memory locks, retrying "
-        f"(attempt={retry_count}, max={max_label})..."
-    )
-
-    if retry_count == 1 or now - last_warning_at >= _MEMORY_LOCK_RETRY_WARNING_INTERVAL_SECONDS:
-        logger.warning(message)
-        return now
-
-    return last_warning_at
-
-
-def _render_memory_schema_locks(
-    *,
-    schemas: list[Any],
-    ctx: RequestContext,
-    viking_fs: VikingFS,
-    user_ids: list[str],
-    agent_ids: list[str],
-) -> tuple[list[str], list[str]]:
-    exact_paths: list[str] = []
-    tree_paths: list[str] = []
-    policy = ctx.namespace_policy
-    user_ids = user_ids or ["default"]
-    agent_ids = agent_ids or ["default"]
-
-    for schema in schemas:
-        directory_template = getattr(schema, "directory", "") or ""
-        if not directory_template:
-            continue
-
-        filename_template = getattr(schema, "filename_template", "") or ""
-        for user_id in user_ids:
-            for agent_id in agent_ids:
-                template_vars = {
-                    "user_space": to_user_space(policy, user_id, agent_id),
-                    "agent_space": to_agent_space(policy, user_id, agent_id),
-                }
-                directory_uri = render_template(directory_template, template_vars)
-                if _filename_has_variables(schema) or not filename_template:
-                    _append_unique(tree_paths, viking_fs._uri_to_path(directory_uri, ctx))
-                    continue
-
-                filename = render_template(filename_template, template_vars)
-                file_uri = f"{directory_uri.rstrip('/')}/{filename.lstrip('/')}"
-                _append_unique(exact_paths, viking_fs._uri_to_path(file_uri, ctx))
-
-    return exact_paths, tree_paths
 
 
 class SessionCompressorV2:
@@ -176,6 +96,44 @@ class SessionCompressorV2:
         return MemoryUpdater(
             registry=registry, vikingdb=self.vikingdb, transaction_handle=transaction_handle
         )
+
+    async def _generate_overviews_with_directory_locks(
+        self,
+        *,
+        overview_directories: Dict[str, str],
+        registry,
+        ctx: RequestContext,
+        extract_context: ExtractContext,
+        lock_manager,
+        viking_fs: VikingFS,
+    ) -> None:
+        if not overview_directories:
+            return
+
+        for directory, memory_type in overview_directories.items():
+            overview_handle = None
+            try:
+                if lock_manager:
+                    overview_handle = lock_manager.create_handle()
+                    acquired = await lock_manager.acquire_tree(
+                        overview_handle,
+                        viking_fs._uri_to_path(directory, ctx),
+                        timeout=None,
+                    )
+                    if not acquired:
+                        raise RuntimeError(
+                            f"Failed to acquire overview directory lock: {directory}"
+                        )
+                updater = self._get_or_create_updater(registry, overview_handle)
+                await updater.generate_overview(
+                    memory_type,
+                    directory,
+                    ctx,
+                    extract_context=extract_context,
+                )
+            finally:
+                if lock_manager and overview_handle:
+                    await lock_manager.release(overview_handle)
 
     def _split_operations_by_memory_type(
         self,
@@ -249,7 +207,6 @@ class SessionCompressorV2:
 
         tracer.info("Starting v2 memory extraction from conversation")
         tracer.info(f"origin_messages={JsonUtils.dumps(messages)}")
-        config = get_openviking_config()
 
         # Initialize default memory files (soul.md, identity.md) if not exist
         from openviking.session.memory.memory_type_registry import create_default_registry
@@ -290,7 +247,6 @@ class SessionCompressorV2:
             # Create MemoryIsolationHandler
             isolation_handler = MemoryIsolationHandler(ctx, extract_context)
             isolation_handler.prepare_messages()
-            # 获取所有记忆 schema 目录并加锁（仅在有锁管理器时）
             orchestrator = self._get_or_create_react(
                 ctx=ctx,
                 messages=messages,
@@ -298,49 +254,6 @@ class SessionCompressorV2:
                 isolation_handler=isolation_handler,
                 transaction_handle=transaction_handle,
             )
-            read_scope = isolation_handler.get_read_scope()
-            if lock_manager:
-                schemas = orchestrator.context_provider.get_memory_schemas(ctx)
-                exact_lock_paths, tree_lock_dirs = _render_memory_schema_locks(
-                    schemas=schemas,
-                    ctx=ctx,
-                    viking_fs=viking_fs,
-                    user_ids=read_scope.user_ids,
-                    agent_ids=read_scope.agent_ids,
-                )
-                logger.debug(
-                    f"Memory schema locks: exact={exact_lock_paths}, tree={tree_lock_dirs}"
-                )
-
-                retry_interval = config.memory.v2_lock_retry_interval_seconds
-                max_retries = config.memory.v2_lock_max_retries
-                retry_count = 0
-                last_lock_retry_warning_at = 0.0
-
-                # 循环重试获取锁（机制确保不会死锁）
-                while True:
-                    lock_acquired = await lock_manager.acquire_exact_tree_batch(
-                        transaction_handle,
-                        exact_paths=exact_lock_paths,
-                        tree_paths=tree_lock_dirs,
-                        timeout=None,
-                    )
-                    if lock_acquired:
-                        break
-                    retry_count += 1
-                    if max_retries > 0 and retry_count >= max_retries:
-                        raise TimeoutError(
-                            "Failed to acquire memory locks after "
-                            f"{retry_count} retries (max={max_retries})"
-                        )
-
-                    last_lock_retry_warning_at = _log_memory_lock_retry(
-                        retry_count=retry_count,
-                        max_retries=max_retries,
-                        last_warning_at=last_lock_retry_warning_at,
-                    )
-                    if retry_interval > 0:
-                        await asyncio.sleep(retry_interval)
 
             orchestrator._transaction_handle = transaction_handle  # 传递给 ExtractLoop
 
@@ -699,50 +612,6 @@ class SessionCompressorV2:
             transaction_handle = lock_manager.create_handle()
 
         try:
-            if lock_manager:
-                schemas = [
-                    schema
-                    for schema in provider.get_memory_schemas(ctx)
-                    if getattr(schema, "memory_type", None) != SESSION_SKILL_MEMORY_TYPE
-                ]
-                user_ids = [ctx.user.user_id] if ctx and ctx.user else ["default"]
-                agent_ids = [ctx.user.agent_id] if ctx and ctx.user else ["default"]
-                exact_lock_paths, tree_lock_dirs = _render_memory_schema_locks(
-                    schemas=schemas,
-                    ctx=ctx,
-                    viking_fs=viking_fs,
-                    user_ids=user_ids,
-                    agent_ids=agent_ids,
-                )
-
-                retry_interval = config.memory.v2_lock_retry_interval_seconds
-                max_retries = config.memory.v2_lock_max_retries
-                retry_count = 0
-                last_lock_retry_warning_at = 0.0
-                while True:
-                    lock_acquired = await lock_manager.acquire_exact_tree_batch(
-                        transaction_handle,
-                        exact_paths=exact_lock_paths,
-                        tree_paths=tree_lock_dirs,
-                        timeout=None,
-                    )
-                    if lock_acquired:
-                        break
-                    retry_count += 1
-                    if max_retries > 0 and retry_count >= max_retries:
-                        raise TimeoutError(
-                            f"[{phase_label}] Failed to acquire memory locks after "
-                            f"{retry_count} retries (max={max_retries})"
-                        )
-                    last_lock_retry_warning_at = _log_memory_lock_retry(
-                        retry_count=retry_count,
-                        max_retries=max_retries,
-                        last_warning_at=last_lock_retry_warning_at,
-                        phase_label=phase_label,
-                    )
-                    if retry_interval > 0:
-                        await asyncio.sleep(retry_interval)
-
             provider._transaction_handle = transaction_handle
             orchestrator._transaction_handle = transaction_handle
             operations, _ = await orchestrator.run()
@@ -776,13 +645,13 @@ class SessionCompressorV2:
                     unsupported_skill_deletes,
                 )
 
+            registry = provider._get_registry()
             memory_result = MemoryUpdateResult()
             if (
                 memory_operations.upsert_operations
                 or memory_operations.delete_file_contents
                 or memory_operations.errors
             ):
-                registry = provider._get_registry()
                 updater = self._get_or_create_updater(registry, transaction_handle)
                 memory_result = await updater.apply_operations(
                     memory_operations,
@@ -830,6 +699,19 @@ class SessionCompressorV2:
                 contexts.append(Context(uri=uri, category="memory_edit", context_type="memory"))
             for uri in memory_result.deleted_uris:
                 contexts.append(Context(uri=uri, category="memory_delete", context_type="memory"))
+
+            if lock_manager and transaction_handle and memory_result.overview_directories:
+                await lock_manager.release(transaction_handle)
+                transaction_handle = None
+
+            await self._generate_overviews_with_directory_locks(
+                overview_directories=memory_result.overview_directories,
+                registry=registry,
+                ctx=ctx,
+                extract_context=extract_context,
+                lock_manager=lock_manager,
+                viking_fs=viking_fs,
+            )
 
             return (
                 list(memory_result.written_uris),

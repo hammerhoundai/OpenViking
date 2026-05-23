@@ -17,6 +17,8 @@ from openviking.session.memory.dataclass import (
 from openviking.session.memory.extract_loop import (
     ExtractLoop,
 )
+from openviking.session.memory.lock_scope import LockScope
+from openviking.session.memory.memory_file_tracker import MemoryFileTracker
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
 from openviking.session.memory.memory_updater import MemoryUpdater, MemoryUpdateResult
 from openviking.session.memory.merge_op import FieldType, MergeOp
@@ -61,6 +63,8 @@ __all__ = [
     "MemoryUpdateResult",
     # ExtractLoop
     "ExtractLoop",
+    "LockScope",
+    "MemoryFileTracker",
     # Tools (Tool implementations)
     "MemoryTool",
     "MemoryReadTool",

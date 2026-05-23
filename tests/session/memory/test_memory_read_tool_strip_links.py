@@ -20,7 +20,7 @@ class MockVikingFS:
             "Gina values [emotional support](../../events/2023/03/23/mutual_business_support.md) "
             "with Jon.\n\n"
             "<!-- MEMORY_FIELDS\n"
-            "{\"memory_type\": \"experiences\"}\n"
+            '{"memory_type": "experiences"}\n'
             "-->"
         )
 
@@ -40,7 +40,7 @@ async def test_read_tool_strips_local_memory_links_from_llm_content():
         uri="viking://user/default/memories/experiences/test.md",
     )
 
-    assert result["content"] == "1 | Gina values emotional support with Jon."
+    assert result["content"] == "1\tGina values emotional support with Jon."
 
 
 @pytest.mark.asyncio
@@ -69,4 +69,4 @@ async def test_read_tool_uses_memory_file_plain_content(monkeypatch):
     )
 
     assert called is True
-    assert result["content"] == "1 | Gina values emotional support with Jon."
+    assert result["content"] == "1\tGina values emotional support with Jon."

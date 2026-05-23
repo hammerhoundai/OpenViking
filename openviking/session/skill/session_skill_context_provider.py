@@ -122,6 +122,7 @@ class SessionSkillContextProvider(SessionExtractContextProvider):
                         "abstract": entry.get("abstract", ""),
                     }
                 )
+            self._memory_file_tracker.track_many(item.get("uri", "") for item in listed_skills)
             add_tool_call_pair_to_messages(
                 messages=pre_fetch_messages,
                 call_id=0,
@@ -168,6 +169,7 @@ class SessionSkillContextProvider(SessionExtractContextProvider):
             limit=limit,
         )
         self._read_file_contents[uri] = stored
+        self._memory_file_tracker.mark_read(uri)
         return result
 
     def get_tools(self) -> List[str]:

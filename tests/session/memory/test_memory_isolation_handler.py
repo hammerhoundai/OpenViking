@@ -239,8 +239,8 @@ class TestPrepareMessages:
     """Tests for prepare_messages with enable_role_id_memory_isolate toggle."""
 
     @patch("openviking.session.memory.memory_isolation_handler.get_openviking_config")
-    def test_prepare_messages_disabled_clears_role_ids(self, mock_config):
-        """开关关闭时，prepare_messages 清空所有 message 的 role_id。"""
+    def test_prepare_messages_disabled_normalizes_role_ids(self, mock_config):
+        """开关关闭时，prepare_messages 用当前登录身份规则归一化 role_id。"""
         mock_memory_config = MagicMock()
         mock_memory_config.enable_role_id_memory_isolate = False
         mock_config.return_value.memory = mock_memory_config
@@ -255,8 +255,9 @@ class TestPrepareMessages:
         handler = MemoryIsolationHandler(ctx, extract_ctx)
         handler.prepare_messages()
 
-        for msg in messages:
-            assert msg.role_id is None
+        assert messages[0].role_id == "user_a"
+        assert messages[1].role_id == "agent_a"
+        assert messages[2].role_id == "user_b"
 
     @patch("openviking.session.memory.memory_isolation_handler.get_openviking_config")
     def test_prepare_messages_enabled_keeps_role_ids(self, mock_config):
@@ -279,7 +280,7 @@ class TestPrepareMessages:
 
     @patch("openviking.session.memory.memory_isolation_handler.get_openviking_config")
     def test_get_read_scope_with_prepare_disabled(self, mock_config):
-        """开关关闭时，get_read_scope 只返回登录用户（因为 role_id 被清空）。"""
+        """开关关闭时，prepare_messages 后仍按现有 message role_id 提取参与者。"""
         mock_memory_config = MagicMock()
         mock_memory_config.enable_role_id_memory_isolate = False
         mock_config.return_value.memory = mock_memory_config
@@ -294,8 +295,8 @@ class TestPrepareMessages:
         handler.prepare_messages()
         scope = handler.get_read_scope()
 
-        assert scope.user_ids == ["login_user"]
-        assert scope.agent_ids == ["login_agent"]
+        assert scope.user_ids == ["user_a"]
+        assert scope.agent_ids == ["agent_a"]
 
     @patch("openviking.session.memory.memory_isolation_handler.get_openviking_config")
     def test_get_read_scope_with_prepare_enabled(self, mock_config):
@@ -319,7 +320,7 @@ class TestPrepareMessages:
 
     @patch("openviking.session.memory.memory_isolation_handler.get_openviking_config")
     def test_prepare_messages_no_config(self, mock_config):
-        """没有 memory 配置时，默认关闭，清空 role_id。"""
+        """没有 memory 配置时，默认关闭并按当前规则保留/补全 role_id。"""
         mock_config.return_value.memory = None
 
         ctx = create_ctx(user_id="login_user", agent_id="login_agent")
@@ -330,7 +331,7 @@ class TestPrepareMessages:
         handler = MemoryIsolationHandler(ctx, extract_ctx)
         handler.prepare_messages()
 
-        assert messages[0].role_id is None
+        assert messages[0].role_id == "user_a"
 
 
 class TestCalculateMemoryUris:
@@ -368,7 +369,7 @@ class TestCalculateMemoryUris:
 
     @patch("openviking.session.memory.memory_isolation_handler.generate_uri")
     def test_calculate_memory_uris_multiple_users_agents(self, mock_generate_uri):
-        """Test calculate_memory_uris with multiple users and agents."""
+        """Test calculate_memory_uris deduplicates generated URIs."""
         mock_generate_uri.side_effect = lambda **kwargs: (
             f"viking://user/{kwargs.get('user_space')}/memories/test"
         )
@@ -395,4 +396,8 @@ class TestCalculateMemoryUris:
 
         uris = handler.calculate_memory_uris(schema, operation, extract_ctx)
 
-        assert len(uris) == 4  # 2 users * 2 agents
+        assert len(uris) == 2
+        assert set(uris) == {
+            "viking://user/user_a/memories/test",
+            "viking://user/user_b/memories/test",
+        }

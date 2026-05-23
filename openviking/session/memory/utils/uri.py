@@ -63,7 +63,7 @@ def generate_uri(
     user_space: str = "default",
     agent_space: str = "default",
     extract_context: Any = None,
-) -> tuple[str, str]:
+) -> str:
     """
     Generate a full URI from memory type schema and field values.
 
@@ -80,20 +80,30 @@ def generate_uri(
     Raises:
         ValueError: If required template variables are missing from fields
     """
-    # Build the URI template from directory and filename_template
-
-    dir_template = memory_type.directory
-    uri_template = f"{dir_template}/{memory_type.filename_template}"
-    # Build the context for Jinja2 rendering - include user_space and agent_space
     context = {
         "user_space": user_space,
         "agent_space": agent_space,
     }
-    # Add all fields to context (uri_fields with actual values)
     context.update(fields)
-    # Render using unified render_template method (same as content_template)
-    uri = render_template(uri_template, context, extract_context)
-    return uri
+
+    template_vars = set(re.findall(r"\{\{\s*(\w+)\s*\}\}", memory_type.directory or ""))
+    template_vars.update(re.findall(r"\{\{\s*(\w+)\s*\}\}", memory_type.filename_template or ""))
+
+    built_in_vars = {"user_space", "agent_space"}
+    for var in template_vars - built_in_vars:
+        if var not in fields:
+            raise ValueError(f"Missing template variable: {var}")
+        if fields[var] is None:
+            raise ValueError(f"Template variable {var} has None value")
+
+    parts = []
+    if memory_type.directory:
+        parts.append(render_template(memory_type.directory, context, extract_context).rstrip("/"))
+    if memory_type.filename_template:
+        parts.append(
+            render_template(memory_type.filename_template, context, extract_context).lstrip("/")
+        )
+    return "/".join(part for part in parts if part)
 
 
 def validate_uri_template(memory_type: MemoryTypeSchema) -> bool:

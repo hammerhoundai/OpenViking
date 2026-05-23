@@ -4,7 +4,6 @@
 Tests for MemoryUpdater.
 """
 
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -13,8 +12,8 @@ from openviking.message import Message
 from openviking.message.part import TextPart
 from openviking.server.identity import AccountNamespacePolicy, RequestContext, Role
 from openviking.session.memory.dataclass import (
-    MemoryFile,
     MemoryField,
+    MemoryFile,
     MemoryTypeSchema,
     ResolvedOperation,
     ResolvedOperations,
@@ -232,7 +231,7 @@ class TestMemoryUpdater:
             ),
         ],
     )
-    async def test_apply_operations_matches_overview_directories_with_namespace_policy(
+    async def test_apply_operations_reports_overview_directories_with_namespace_policy(
         self,
         monkeypatch,
         policy,
@@ -241,7 +240,7 @@ class TestMemoryUpdater:
         expected_directory,
         memory_type,
     ):
-        """Overview generation should use policy-expanded user/agent space fragments."""
+        """Overview targets should use policy-expanded user/agent space fragments."""
         schema = MemoryTypeSchema(
             memory_type=memory_type,
             description=f"{memory_type} memory",
@@ -280,12 +279,9 @@ class TestMemoryUpdater:
         result = await updater.apply_operations(operations=resolved, ctx=ctx)
 
         assert result.written_uris == [resolved_uri]
-        updater.generate_overview.assert_awaited_once_with(
-            memory_type,
-            expected_directory,
-            ctx,
-            None,
-        )
+        assert result.overview_directories == {expected_directory: memory_type}
+        updater.generate_overview.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_apply_operations_skips_link_updates_for_deleted_uris(self, monkeypatch):
         deleted_uri = "viking://agent/agent_sample_3/memories/experiences/old.md"
@@ -307,7 +303,9 @@ class TestMemoryUpdater:
         updater.generate_overview = AsyncMock()
 
         mock_viking_fs = MagicMock()
-        mock_viking_fs.read_file = AsyncMock(side_effect=AssertionError("deleted URI should not be read"))
+        mock_viking_fs.read_file = AsyncMock(
+            side_effect=AssertionError("deleted URI should not be read")
+        )
         mock_viking_fs.write_file = AsyncMock()
         updater._get_viking_fs = MagicMock(return_value=mock_viking_fs)
 
@@ -319,7 +317,9 @@ class TestMemoryUpdater:
                     uris=[written_uri],
                 )
             ],
-            delete_file_contents=[MemoryFile(uri=deleted_uri, extra_fields={"memory_type": "experiences"})],
+            delete_file_contents=[
+                MemoryFile(uri=deleted_uri, extra_fields={"memory_type": "experiences"})
+            ],
             errors=[],
             resolved_links=[
                 StoredLink(
@@ -328,7 +328,6 @@ class TestMemoryUpdater:
                 )
             ],
         )
-
 
         async def mock_apply_upsert(resolved_op, ctx, extract_context=None):
             return None
@@ -349,8 +348,12 @@ class TestMemoryUpdater:
 
     @pytest.mark.asyncio
     async def test_apply_operations_routes_backlinks_to_matching_uri_only(self):
-        caroline_uri = "viking://user/Caroline/memories/events/2023/05/08/career_education_planning.md"
-        melanie_uri = "viking://user/Melanie/memories/events/2023/05/08/career_education_planning.md"
+        caroline_uri = (
+            "viking://user/Caroline/memories/events/2023/05/08/career_education_planning.md"
+        )
+        melanie_uri = (
+            "viking://user/Melanie/memories/events/2023/05/08/career_education_planning.md"
+        )
         profile_uri = "viking://user/Caroline/memories/profile.md"
 
         schema = MemoryTypeSchema(
@@ -769,7 +772,9 @@ class TestConsecutivePatchesSameURI:
         trace_info = MagicMock()
         patch_warning = MagicMock()
         monkeypatch.setattr("openviking.session.memory.memory_updater.tracer.info", trace_info)
-        monkeypatch.setattr("openviking.session.memory.merge_op.patch_handler.logger.warning", patch_warning)
+        monkeypatch.setattr(
+            "openviking.session.memory.merge_op.patch_handler.logger.warning", patch_warning
+        )
 
         op = ResolvedOperation(
             old_memory_file_content=MemoryFile(

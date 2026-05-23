@@ -6,25 +6,17 @@ Tests for memory utilities - URI generation, etc.
 
 import pytest
 
-from openviking.session.memory.dataclass import (
-    MemoryField,
-    MemoryFile,
-    MemoryOperations,
-    MemoryTypeSchema,
-)
+from openviking.session.memory.dataclass import MemoryField, MemoryFile, MemoryTypeSchema
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
 from openviking.session.memory.merge_op.base import FieldType, MergeOp
 from openviking.session.memory.utils import (
-    collect_allowed_directories,
-    collect_allowed_path_patterns,
     generate_uri,
     is_uri_allowed,
-    is_uri_allowed_for_schema,
     parse_memory_file_with_fields,
-    resolve_all_operations,
     validate_uri_template,
 )
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
+from openviking.session.memory.utils.uri import extract_uri_fields_from_flat_model
 
 
 class TestUriGeneration:
@@ -201,23 +193,28 @@ class TestUriGeneration:
 class TestUriValidation:
     """Tests for URI validation."""
 
-    def test_collect_allowed_directories(self):
-        """Test collecting allowed directories from schemas."""
-        schemas = [
+    def test_list_search_uris_collects_enabled_schema_directories(self):
+        """Test collecting enabled schema directories from the registry."""
+        registry = MemoryTypeRegistry(load_schemas=False)
+        registry.register(
             MemoryTypeSchema(
                 memory_type="preferences",
                 description="Preferences",
                 directory="viking://user/{{ user_space }}/memories/preferences",
                 filename_template="{{ topic }}.md",
                 fields=[],
-            ),
+            )
+        )
+        registry.register(
             MemoryTypeSchema(
                 memory_type="tools",
                 description="Tools",
                 directory="viking://agent/{{ agent_space }}/memories/tools",
                 filename_template="{{ tool_name }}.md",
                 fields=[],
-            ),
+            )
+        )
+        registry.register(
             MemoryTypeSchema(
                 memory_type="disabled",
                 description="Disabled",
@@ -225,37 +222,15 @@ class TestUriValidation:
                 filename_template="",
                 fields=[],
                 enabled=False,
-            ),
-        ]
-
-        dirs = collect_allowed_directories(
-            [s for s in schemas if s.enabled], user_space="default", agent_space="default"
+            )
         )
 
-        assert dirs == {
+        uris = registry.list_search_uris(user_space="default", agent_space="default")
+
+        assert uris == [
             "viking://user/default/memories/preferences",
             "viking://agent/default/memories/tools",
-        }
-
-    def test_collect_allowed_path_patterns(self):
-        """Test collecting allowed path patterns from schemas."""
-        schemas = [
-            MemoryTypeSchema(
-                memory_type="preferences",
-                description="Preferences",
-                directory="viking://user/{{ user_space }}/memories/preferences",
-                filename_template="{{ topic }}.md",
-                fields=[],
-            ),
         ]
-
-        patterns = collect_allowed_path_patterns(
-            schemas, user_space="default", agent_space="default"
-        )
-
-        assert patterns == {
-            "viking://user/default/memories/preferences/{{ topic }}.md",
-        }
 
     def test_is_uri_allowed_by_directory(self):
         """Test URI allowed by matching directory prefix."""
@@ -333,126 +308,32 @@ class TestUriValidation:
             is False
         )
 
-    def test_is_uri_allowed_for_schema(self):
-        """Test checking URI against schemas."""
-        schemas = [
-            MemoryTypeSchema(
-                memory_type="preferences",
-                description="Preferences",
-                directory="viking://user/{{ user_space }}/memories/preferences",
-                filename_template="{{ topic }}.md",
-                fields=[],
-            ),
-        ]
 
-        assert (
-            is_uri_allowed_for_schema(
-                "viking://user/default/memories/preferences/test.md",
-                schemas,
-            )
-            is True
-        )
+class TestUriHelpers:
+    """Tests for current URI helper methods."""
 
-        assert (
-            is_uri_allowed_for_schema(
-                "viking://user/default/memories/other/test.md",
-                schemas,
-            )
-            is False
-        )
-
-
-class TestUriResolution:
-    """Tests for URI resolution methods."""
-
-    @pytest.fixture
-    def test_registry(self):
-        """Create a test registry with sample schemas."""
-        registry = MemoryTypeRegistry()
-
-        # Add preferences schema
-        registry.register(
-            MemoryTypeSchema(
-                memory_type="preferences",
-                description="User preferences",
-                directory="viking://user/{{ user_space }}/memories/preferences",
-                filename_template="{{ topic }}.md",
-                fields=[
-                    MemoryField(name="topic", field_type=FieldType.STRING, description="Topic"),
-                ],
-            )
-        )
-
-        # Add tools schema
-        registry.register(
-            MemoryTypeSchema(
-                memory_type="tools",
-                description="Tool memories",
-                directory="viking://agent/{{ agent_space }}/memories/tools",
-                filename_template="{{ tool_name }}.md",
-                fields=[
-                    MemoryField(
-                        name="tool_name", field_type=FieldType.STRING, description="Tool name"
-                    ),
-                ],
-            )
-        )
-
-        return registry
-
-    def test_resolve_all_operations(self, test_registry):
-        """Test resolving all operations at once."""
-        operations = MemoryOperations(
-            write_uris=[
-                {
-                    "memory_type": "preferences",
-                    "topic": "Write test",
-                    "content": "Write content",
-                },
-            ],
-            edit_uris=[
-                {
-                    "memory_type": "tools",
-                    "tool_name": "edit_tool",
-                    "content": "Updated",
-                },
-            ],
-            delete_uris=[
-                "viking://user/default/memories/preferences/Delete me.md",
+    def test_extract_uri_fields_from_flat_model_ignores_non_primitive_values(self):
+        schema = MemoryTypeSchema(
+            memory_type="preferences",
+            description="Preferences",
+            directory="viking://user/{{ user_space }}/memories/preferences",
+            filename_template="{{ topic }}.md",
+            fields=[
+                MemoryField(name="topic", field_type=FieldType.STRING, description="Topic"),
+                MemoryField(name="details", field_type=FieldType.STRING, description="Details"),
             ],
         )
 
-        resolved = resolve_all_operations(operations, test_registry)
-
-        assert resolved.has_errors() is False
-        # All operations are now unified into operations list
-        assert len(resolved.operations) == 2
-        assert len(resolved.delete_operations) == 1
-
-        # Verify resolved URIs - both write and edit go to operations list
-        uris = [op.uri for op in resolved.operations]
-        assert "viking://user/default/memories/preferences/Write test.md" in uris
-        assert "viking://agent/default/memories/tools/edit_tool.md" in uris
-        assert (
-            resolved.delete_operations[0][1]
-            == "viking://user/default/memories/preferences/Delete me.md"
+        fields = extract_uri_fields_from_flat_model(
+            {
+                "topic": "Write test",
+                "details": {"nested": True},
+                "ignored": "value",
+            },
+            schema,
         )
 
-    def test_resolve_all_operations_with_errors(self, test_registry):
-        """Test resolving operations with errors."""
-        operations = MemoryOperations(
-            write_uris=[
-                {
-                    "memory_type": "unknown",
-                },
-            ],
-        )
-
-        resolved = resolve_all_operations(operations, test_registry)
-
-        assert resolved.has_errors() is True
-        assert len(resolved.errors) == 1
-        assert "Failed to resolve" in resolved.errors[0]
+        assert fields == {"topic": "Write test"}
 
 
 class TestParseMemoryFileWithFields:

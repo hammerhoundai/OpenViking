@@ -8,7 +8,7 @@ Reference: bot/vikingbot/agent/loop.py AgentLoop structure
 
 import asyncio
 import json
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from openviking.models.vlm.base import ToolCall, VLMBase
 from openviking.server.identity import RequestContext
@@ -18,6 +18,7 @@ from openviking.session.memory.dataclass import (
     ResolvedOperations,
     StoredLink,
 )
+from openviking.session.memory.lock_scope import LockScope
 from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
 from openviking.session.memory.merge_op import MergeOp
 from openviking.session.memory.schema_model_generator import (
@@ -33,6 +34,7 @@ from openviking.session.memory.utils import (
     pretty_print_messages,
 )
 from openviking.session.memory.utils.json_parser import JsonUtils
+from openviking.storage.transaction import get_lock_manager
 from openviking.storage.viking_fs import VikingFS, get_viking_fs
 from openviking.telemetry import bind_telemetry_stage, tracer
 from openviking_cli.utils import get_logger
@@ -95,6 +97,7 @@ class ExtractLoop:
 
         # Transaction handle for file locking
         self._transaction_handle = None
+        self._lock_scope: Optional[LockScope] = None
         # Flag to disable tools in next iteration after unknown tool error
         self._disable_tools_for_iteration = False
 
@@ -150,6 +153,7 @@ class ExtractLoop:
         self._extract_context = self.context_provider.get_extract_context()
         if self._extract_context is None:
             raise ValueError("Failed to get ExtractContext from provider")
+        self._ensure_lock_scope()
         for schema in schemas:
             self._expected_fields.append(f"{schema.memory_type}")
 
@@ -306,6 +310,7 @@ The final output of the model must strictly follow the JSON Schema format shown 
             else:
                 raise RuntimeError("ReAct loop completed but no operations generated")
 
+        await self._relock_for_final_operations(final_operations)
         tracer.info(f"final_operations={final_operations.model_dump_json(indent=4)}")
 
         # Resolve links after the loop completes using the URIs already bound in resolve_operations().
@@ -548,6 +553,66 @@ The final output of the model must strictly follow the JSON Schema format shown 
 
         return resolved_links
 
+    def _ensure_lock_scope(self) -> None:
+        if self._lock_scope is not None or self._transaction_handle is None:
+            return
+        if self.viking_fs is None or not getattr(self.viking_fs, "agfs", None):
+            return
+        self._lock_scope = LockScope(get_lock_manager(), self._transaction_handle)
+
+    async def _relock_for_read_uris(self, read_uris: Iterable[str]) -> None:
+        if self._lock_scope is None:
+            return
+
+        tracked_read_uris = getattr(
+            getattr(self.context_provider, "memory_file_tracker", None), "read_uris", []
+        )
+        desired_read_uris = []
+        seen_uris = set()
+        for uri in [*(tracked_read_uris or []), *(read_uris or [])]:
+            normalized = str(uri or "").strip()
+            if not normalized or normalized in seen_uris:
+                continue
+            seen_uris.add(normalized)
+            desired_read_uris.append(normalized)
+        if desired_read_uris:
+            await self._lock_scope.relock_to(desired_read_uris, timeout=None)
+
+    async def _relock_for_final_operations(self, operations: ResolvedOperations) -> None:
+        if self._lock_scope is None:
+            return
+
+        tracked_read_uris = getattr(
+            getattr(self.context_provider, "memory_file_tracker", None), "read_uris", []
+        )
+        desired_uris = []
+        seen_uris = set()
+
+        for uri in tracked_read_uris or []:
+            normalized = str(uri or "").strip()
+            if not normalized or normalized in seen_uris:
+                continue
+            seen_uris.add(normalized)
+            desired_uris.append(normalized)
+
+        for operation in operations.upsert_operations:
+            for uri in operation.uris:
+                normalized = str(uri or "").strip()
+                if not normalized or normalized in seen_uris:
+                    continue
+                seen_uris.add(normalized)
+                desired_uris.append(normalized)
+
+        for memory_file in operations.delete_file_contents:
+            normalized = str(getattr(memory_file, "uri", "") or "").strip()
+            if not normalized or normalized in seen_uris:
+                continue
+            seen_uris.add(normalized)
+            desired_uris.append(normalized)
+
+        if desired_uris:
+            await self._lock_scope.relock_to(desired_uris, timeout=None)
+
     @tracer("extract_loop.execute_tool_calls")
     async def _execute_tool_calls(self, messages, tool_calls, tools_used) -> bool:
         """
@@ -557,6 +622,12 @@ The final output of the model must strictly follow the JSON Schema format shown 
             True if any tool call returned "Unknown tool" error, indicating
             the model should not receive tools in the next iteration.
         """
+        pending_read_uris = [
+            str(tool_call.arguments.get("uri", "")).strip()
+            for tool_call in tool_calls
+            if tool_call.name == "read" and tool_call.arguments is not None
+        ]
+        await self._relock_for_read_uris(pending_read_uris)
 
         # Execute all tool calls in parallel
         async def execute_single_tool_call(idx: int, tool_call):
@@ -709,22 +780,33 @@ The final output of the model must strictly follow the JSON Schema format shown 
 
     async def _check_unread_existing_files(self, operations: ResolvedOperations) -> Dict:
         refetch_uris = {}
+        pending_read_uris = []
+        seen_uris = set()
         for operation in operations.upsert_operations:
             for uri in operation.uris:
                 if uri in self.context_provider.read_file_contents:
                     continue
-                try:
-                    content = await self.context_provider.execute_tool(
-                        ToolCall(id="", name="read", arguments={"uri": uri})
-                    )
-                    # 读取出错表示文件不存在（error dict 含 "error" key）
-                    if isinstance(content, Dict) and "error" in content:
-                        continue
+                normalized = str(uri or "").strip()
+                if not normalized or normalized in seen_uris:
+                    continue
+                seen_uris.add(normalized)
+                pending_read_uris.append(normalized)
 
-                    # execute_tool(MemoryReadTool) 已经返回 parsed dict，直接使用
-                    refetch_uris[uri] = content
-                except Exception as e:
-                    tracer.error("read tool execute fail", e)
+        await self._relock_for_read_uris(pending_read_uris)
+
+        for uri in pending_read_uris:
+            try:
+                content = await self.context_provider.execute_tool(
+                    ToolCall(id="", name="read", arguments={"uri": uri})
+                )
+                # 读取出错表示文件不存在（error dict 含 "error" key）
+                if isinstance(content, Dict) and "error" in content:
+                    continue
+
+                # execute_tool(MemoryReadTool) 已经返回 parsed dict，直接使用
+                refetch_uris[uri] = content
+            except Exception as e:
+                tracer.error("read tool execute fail", e)
         return refetch_uris
 
     def _add_format_error_message(self, messages: List[Dict[str, Any]]) -> None:

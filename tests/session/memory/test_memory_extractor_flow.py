@@ -24,6 +24,9 @@ from openviking.session.memory import (
     MemoryUpdater,
     MemoryUpdateResult,
 )
+from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
+from openviking.session.memory.memory_updater import ExtractContext
+from openviking.session.memory.session_extract_context_provider import SessionExtractContextProvider
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils.config import get_openviking_config, initialize_openviking_config
 
@@ -503,30 +506,43 @@ class TestMemoryExtractorFlow:
         print(conversation_str[:800] + "..." if len(conversation_str) > 800 else conversation_str)
         print("-" * 60)
 
-        # Initialize orchestrator with real VLM!
+        # Initialize provider and orchestrator with current contract
+        extract_context = ExtractContext(messages)
+        isolation_handler = MemoryIsolationHandler(ctx, extract_context)
+        context_provider = SessionExtractContextProvider(
+            messages=messages,
+            ctx=ctx,
+            viking_fs=viking_fs,
+            isolation_handler=isolation_handler,
+        )
         orchestrator = ExtractLoop(
             vlm=vlm,
             viking_fs=viking_fs,
             ctx=ctx,
+            context_provider=context_provider,
+            isolation_handler=isolation_handler,
         )
 
         # Take snapshot BEFORE running orchestrator to capture all changes
         viking_fs.snapshot()
 
         # Actually run the orchestrator with real LLM calls!
-        operations, tools_used = await orchestrator.run(
-            messages=messages,
-        )
+        operations, tools_used = await orchestrator.run()
 
         # Verify results
         assert operations is not None
         assert tools_used is not None
 
+        upsert_count = len(operations.upsert_operations)
+        edit_count = sum(1 for op in operations.upsert_operations if op.is_edit())
+        write_count = upsert_count - edit_count
+        delete_count = len(operations.delete_file_contents)
+
         print("-" * 60)
         print("生成的操作：")
-        print(f"  写入：{len(operations.write_uris)}")
-        print(f"  编辑：{len(operations.edit_uris)}")
-        print(f"  删除：{len(operations.delete_uris)}")
+        print(f"  写入：{write_count}")
+        print(f"  编辑：{edit_count}")
+        print(f"  删除：{delete_count}")
         print(f"  使用的工具：{len(tools_used)}")
         print("-" * 60)
 
@@ -534,8 +550,12 @@ class TestMemoryExtractorFlow:
         with patch(
             "openviking.session.memory.memory_updater.get_viking_fs", return_value=viking_fs
         ):
-            updater = MemoryUpdater(registry=orchestrator.registry)
-            result = await updater.apply_operations(operations, ctx)
+            updater = MemoryUpdater(registry=context_provider._get_registry())
+            result = await updater.apply_operations(
+                operations,
+                ctx,
+                extract_context=extract_context,
+            )
 
             assert isinstance(result, MemoryUpdateResult)
 
@@ -551,9 +571,7 @@ class TestMemoryExtractorFlow:
             print_diff(diff)
 
         # Check that at least something happened (could be write/edit/delete depending on LLM)
-        total_changes = (
-            len(operations.write_uris) + len(operations.edit_uris) + len(operations.delete_uris)
-        )
+        total_changes = upsert_count + delete_count
         print(f"LLM 建议的总变更数：{total_changes}")
 
     @pytest.mark.integration
@@ -593,57 +611,52 @@ class TestMemoryExtractorFlow:
         print(conversation_str)
         print("=" * 60)
 
-        # Initialize orchestrator with real VLM!
+        # Initialize provider and orchestrator with current contract
+        extract_context = ExtractContext(messages)
+        isolation_handler = MemoryIsolationHandler(ctx, extract_context)
+        context_provider = SessionExtractContextProvider(
+            messages=messages,
+            ctx=ctx,
+            viking_fs=viking_fs,
+            isolation_handler=isolation_handler,
+        )
         orchestrator = ExtractLoop(
             vlm=vlm,
             viking_fs=viking_fs,
             ctx=ctx,
+            context_provider=context_provider,
+            isolation_handler=isolation_handler,
         )
 
         # Take snapshot BEFORE running orchestrator to capture all changes
         viking_fs.snapshot()
 
         # Actually run the orchestrator with real LLM calls!
-        operations, tools_used = await orchestrator.run(
-            messages=messages,
-        )
+        operations, tools_used = await orchestrator.run()
 
         # Verify results
         assert operations is not None
         assert tools_used is not None
+        upsert_count = len(operations.upsert_operations)
+        edit_operations = [op for op in operations.upsert_operations if op.is_edit()]
+        edit_count = len(edit_operations)
+        write_count = upsert_count - edit_count
+        delete_count = len(operations.delete_file_contents)
+
         print(f"operations={operations.model_dump_json(indent=4)}")
         print("=" * 60)
         print("生成的操作：")
-        print(f"  写入：{len(operations.write_uris)}")
-        print(f"  编辑：{len(operations.edit_uris)}")
-        print(f"  删除：{len(operations.delete_uris)}")
+        print(f"  写入：{write_count}")
+        print(f"  编辑：{edit_count}")
+        print(f"  删除：{delete_count}")
         print(f"  使用的工具：{len(tools_used)}")
 
-        if operations.edit_uris:
+        if edit_operations:
             print("\n编辑操作详情：")
-            for op in operations.edit_uris:
-                # Handle both dict and model objects
-                if isinstance(op, dict):
-                    print(f"  - memory_type: {op.get('memory_type', 'unknown')}")
-                    if "fields" in op:
-                        print(f"  - fields: {op['fields']}")
-                    if "patches" in op:
-                        print(f"    补丁：{list(op['patches'].keys())}")
-                    if "content" in op:
-                        print(f"  - content: {str(op['content'])[:100]}...")
-                else:
-                    # Try to access as model attributes
-                    memory_type = getattr(op, "memory_type", "unknown")
-                    print(f"  - memory_type: {memory_type}")
-                    fields = getattr(op, "fields", None)
-                    if fields:
-                        print(f"  - fields: {fields}")
-                    patches = getattr(op, "patches", None)
-                    if patches:
-                        print(f"    补丁：{list(patches.keys())}")
-                    content = getattr(op, "content", None)
-                    if content:
-                        print(f"  - content: {str(content)[:100]}...")
+            for op in edit_operations:
+                print(f"  - memory_type: {op.memory_type}")
+                print(f"  - uris: {op.uris}")
+                print(f"  - fields: {op.memory_fields}")
 
         print("=" * 60)
 
@@ -651,8 +664,12 @@ class TestMemoryExtractorFlow:
         with patch(
             "openviking.session.memory.memory_updater.get_viking_fs", return_value=viking_fs
         ):
-            updater = MemoryUpdater(registry=orchestrator.registry)
-            result = await updater.apply_operations(operations, ctx)
+            updater = MemoryUpdater(registry=context_provider._get_registry())
+            result = await updater.apply_operations(
+                operations,
+                ctx,
+                extract_context=extract_context,
+            )
 
             assert isinstance(result, MemoryUpdateResult)
 
@@ -694,9 +711,7 @@ class TestMemoryExtractorFlow:
         print("=" * 60)
 
         # Check that at least something happened (could be write/edit/delete depending on LLM)
-        total_changes = (
-            len(operations.write_uris) + len(operations.edit_uris) + len(operations.delete_uris)
-        )
+        total_changes = upsert_count + delete_count
         print(f"LLM 建议的总变更数：{total_changes}")
 
     def test_message_formatting(self):

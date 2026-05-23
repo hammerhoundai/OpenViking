@@ -5,7 +5,9 @@ from pathlib import Path
 
 import yaml
 
-from openviking.session.memory.utils.content import serialize_with_metadata
+from openviking.session.memory.utils.memory_file_utils import (
+    _serialize_with_metadata as serialize_with_metadata,
+)
 
 
 def _tools_content_template() -> str:

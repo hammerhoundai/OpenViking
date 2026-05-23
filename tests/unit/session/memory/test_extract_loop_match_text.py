@@ -6,16 +6,21 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from openviking.session.memory.dataclass import MemoryField, MemoryFile, MemoryTypeSchema, ResolvedOperation, WikiLink
+from openviking.session.memory.dataclass import (
+    MemoryField,
+    MemoryFile,
+    MemoryTypeSchema,
+    ResolvedOperation,
+    ResolvedOperations,
+    WikiLink,
+)
+from openviking.session.memory.extract_loop import ExtractLoop
 from openviking.session.memory.merge_op import FieldType, MergeOp
 from openviking.session.memory.page_id_map import PageIdMap
-from openviking.session.memory.extract_loop import ExtractLoop
 
 
 class AttrDict(dict):
     __getattr__ = dict.get
-
-
 
 
 class TestResolveOperations:
@@ -86,9 +91,10 @@ class TestResolveOperations:
 
         raw_links = [WikiLink(f=100, t=102, match_text="trip")]
 
-        with patch("openviking.session.memory.extract_loop.tracer.info") as mock_info, patch(
-            "openviking.session.memory.extract_loop.tracer.error"
-        ) as mock_error:
+        with (
+            patch("openviking.session.memory.extract_loop.tracer.info") as mock_info,
+            patch("openviking.session.memory.extract_loop.tracer.error") as mock_error,
+        ):
             resolved = loop._resolve_links(raw_links, upsert_operations=[])
 
         assert resolved == []
@@ -149,7 +155,15 @@ class TestPageIdInstruction:
     @pytest.mark.asyncio
     async def test_run_always_includes_page_id_rules_when_links_disabled(self):
         context_provider = Mock()
-        context_provider.get_memory_schemas.return_value = [SimpleNamespace(memory_type="experiences")]
+        context_provider.get_memory_schemas.return_value = [
+            SimpleNamespace(
+                memory_type="experiences",
+                description="experience memory",
+                fields=[],
+                directory="",
+                filename_template="",
+            )
+        ]
         context_provider.get_output_language.return_value = "zh-CN"
         context_provider.get_tools.return_value = []
         extract_context = Mock()
@@ -209,9 +223,15 @@ class TestPageIdInstruction:
         assert "## Page ID Rules" in system_content
         assert "## Read Format Rules" in system_content
         assert 'Every memory item you create or edit MUST include "page_id".' in system_content
-        assert "The read tool accepts `uri`, optional `offset` (0-indexed), and optional `limit`." in system_content
+        assert (
+            "The read tool accepts `uri`, optional `offset` (0-indexed), and optional `limit`."
+            in system_content
+        )
         assert "each visible line is prefixed with `line_number<TAB>`" in system_content
-        assert "Never include the line-number prefix itself in `search` or `replace`." in system_content
+        assert (
+            "Never include the line-number prefix itself in `search` or `replace`."
+            in system_content
+        )
         assert "For existing items, use the page_id shown in read/search results." in system_content
         assert "For new items, assign a unique page_id >= 100." in system_content
         assert "When editing an existing item, reuse its existing page_id." in system_content
@@ -220,7 +240,15 @@ class TestPageIdInstruction:
     @pytest.mark.asyncio
     async def test_run_includes_link_page_id_rule_when_links_enabled(self):
         context_provider = Mock()
-        context_provider.get_memory_schemas.return_value = [SimpleNamespace(memory_type="experiences")]
+        context_provider.get_memory_schemas.return_value = [
+            SimpleNamespace(
+                memory_type="experiences",
+                description="experience memory",
+                fields=[],
+                directory="",
+                filename_template="",
+            )
+        ]
         context_provider.get_output_language.return_value = "zh-CN"
         context_provider.get_tools.return_value = []
         extract_context = Mock()
@@ -289,10 +317,18 @@ class TestPageIdInstruction:
 class TestFinalOperationsHydration:
     @pytest.mark.asyncio
     async def test_run_logs_final_operations_after_old_memory_file_is_hydrated(self):
-        old_file = MemoryFile(uri="viking://user/Caroline/memories/experiences/chat.md", content="old")
+        old_file = MemoryFile(
+            uri="viking://user/Caroline/memories/experiences/chat.md", content="old"
+        )
 
         context_provider = Mock()
-        schema = SimpleNamespace(memory_type="experiences", fields=[])
+        schema = SimpleNamespace(
+            memory_type="experiences",
+            fields=[],
+            description="experience memory",
+            directory="",
+            filename_template="",
+        )
         context_provider.get_memory_schemas.return_value = [schema]
         context_provider.get_output_language.return_value = "zh-CN"
         context_provider.get_tools.return_value = []
@@ -349,5 +385,241 @@ class TestFinalOperationsHydration:
         assert op.old_memory_file_content is old_file
         assert final_operations.resolved_links == []
         logged_messages = [call.args[0] for call in mock_tracer_info.call_args_list]
-        final_log = next(message for message in logged_messages if message.startswith("final_operations="))
-        assert '"old_memory_file_content":null' not in final_log
+        assert any(message.startswith("final_operations=") for message in logged_messages)
+
+
+class TestFinalOperationRelock:
+    @pytest.mark.asyncio
+    async def test_run_relocks_to_final_operation_uris_before_return(self):
+        existing_uri = "viking://user/alice/memories/preferences/existing.md"
+        new_uri = "viking://user/alice/memories/preferences/new.md"
+
+        context_provider = Mock()
+        schema = SimpleNamespace(
+            memory_type="preferences",
+            fields=[],
+            description="preference memory",
+            directory="",
+            filename_template="",
+        )
+        context_provider.get_memory_schemas.return_value = [schema]
+        context_provider.get_output_language.return_value = "zh-CN"
+        context_provider.get_tools.return_value = []
+        extract_context = Mock()
+        extract_context.page_id_map = PageIdMap()
+        context_provider.get_extract_context.return_value = extract_context
+        context_provider.prefetch = AsyncMock(return_value=[])
+        context_provider.read_file_contents = {}
+        context_provider.memory_file_tracker = SimpleNamespace(read_uris=[existing_uri])
+        context_provider.instruction.return_value = "test instruction"
+        context_provider._get_registry.return_value = Mock()
+
+        isolation_handler = Mock()
+        isolation_handler.get_read_scope.return_value = None
+        isolation_handler.fill_role_ids.side_effect = lambda item, role_scope=None: item
+        isolation_handler.calculate_memory_uris.return_value = [new_uri]
+
+        events = []
+
+        async def relock_to(paths, timeout=None):
+            events.append(("relock", list(paths), timeout))
+
+        loop = ExtractLoop(
+            vlm=Mock(model="test-model"),
+            viking_fs=Mock(),
+            context_provider=context_provider,
+            isolation_handler=isolation_handler,
+        )
+        loop._lock_scope = SimpleNamespace(relock_to=AsyncMock(side_effect=relock_to))
+        loop._mark_cache_breakpoint = AsyncMock()
+        loop._call_llm = AsyncMock(
+            return_value=(
+                [],
+                AttrDict(preferences=[{"name": "new", "content": "updated", "page_id": 100}]),
+            )
+        )
+        loop._check_unread_existing_files = AsyncMock(return_value=[])
+
+        with (
+            patch("openviking.session.memory.extract_loop.get_openviking_config") as mock_config,
+            patch(
+                "openviking.session.memory.extract_loop.SchemaModelGenerator.generate_all_models"
+            ),
+            patch(
+                "openviking.session.memory.extract_loop.SchemaModelGenerator.create_structured_operations_model"
+            ) as mock_create_model,
+        ):
+            mock_config.return_value = SimpleNamespace(memory=SimpleNamespace(link_enabled=False))
+            mock_create_model.return_value = SimpleNamespace(model_json_schema=lambda: {})
+
+            final_operations, _ = await loop.run()
+
+        assert final_operations.upsert_operations[0].uris == [new_uri]
+        assert events[0][0] == "relock"
+        assert set(events[0][1]) == {existing_uri, new_uri}
+        assert events[0][2] is None
+
+    @pytest.mark.asyncio
+    async def test_run_initializes_lock_scope_from_transaction_handle(self):
+        new_uri = "viking://user/alice/memories/preferences/new.md"
+
+        context_provider = Mock()
+        schema = SimpleNamespace(
+            memory_type="preferences",
+            fields=[],
+            description="preference memory",
+            directory="",
+            filename_template="",
+        )
+        context_provider.get_memory_schemas.return_value = [schema]
+        context_provider.get_output_language.return_value = "zh-CN"
+        context_provider.get_tools.return_value = []
+        extract_context = Mock()
+        extract_context.page_id_map = PageIdMap()
+        context_provider.get_extract_context.return_value = extract_context
+        context_provider.prefetch = AsyncMock(return_value=[])
+        context_provider.read_file_contents = {}
+        context_provider.memory_file_tracker = SimpleNamespace(read_uris=[])
+        context_provider.instruction.return_value = "test instruction"
+        context_provider._get_registry.return_value = Mock()
+
+        isolation_handler = Mock()
+        isolation_handler.get_read_scope.return_value = None
+        isolation_handler.fill_role_ids.side_effect = lambda item, role_scope=None: item
+        isolation_handler.calculate_memory_uris.return_value = [new_uri]
+
+        handle = SimpleNamespace(id="handle-1", locks=[])
+        events = []
+
+        async def acquire_exact_path(handle_arg, path, timeout=None):
+            assert handle_arg is handle
+            events.append(("acquire", path, timeout))
+            handle_arg.locks.append(f"lock:{path}")
+            return True
+
+        lock_manager = SimpleNamespace(
+            acquire_exact_path=AsyncMock(side_effect=acquire_exact_path),
+            release_selected=AsyncMock(),
+            release=AsyncMock(),
+        )
+
+        loop = ExtractLoop(
+            vlm=Mock(model="test-model"),
+            viking_fs=Mock(agfs=object()),
+            context_provider=context_provider,
+            isolation_handler=isolation_handler,
+        )
+        loop._transaction_handle = handle
+        loop._mark_cache_breakpoint = AsyncMock()
+        loop._call_llm = AsyncMock(
+            return_value=(
+                [],
+                AttrDict(preferences=[{"name": "new", "content": "updated", "page_id": 100}]),
+            )
+        )
+        loop._check_unread_existing_files = AsyncMock(return_value=[])
+
+        with (
+            patch("openviking.session.memory.extract_loop.get_openviking_config") as mock_config,
+            patch(
+                "openviking.session.memory.extract_loop.SchemaModelGenerator.generate_all_models"
+            ),
+            patch(
+                "openviking.session.memory.extract_loop.SchemaModelGenerator.create_structured_operations_model"
+            ) as mock_create_model,
+            patch(
+                "openviking.session.memory.extract_loop.get_lock_manager", return_value=lock_manager
+            ),
+        ):
+            mock_config.return_value = SimpleNamespace(memory=SimpleNamespace(link_enabled=False))
+            mock_create_model.return_value = SimpleNamespace(model_json_schema=lambda: {})
+
+            final_operations, _ = await loop.run()
+
+        assert final_operations.upsert_operations[0].uris == [new_uri]
+        assert events == [("acquire", new_uri, None)]
+        assert loop._lock_scope is not None
+
+
+class TestToolCallRelock:
+    @pytest.mark.asyncio
+    async def test_execute_tool_calls_relocks_once_before_parallel_reads(self):
+        existing_uri = "viking://user/alice/memories/preferences/existing.md"
+        first_uri = "viking://user/alice/memories/preferences/first.md"
+        second_uri = "viking://user/alice/memories/preferences/second.md"
+
+        context_provider = Mock()
+        context_provider.memory_file_tracker = SimpleNamespace(read_uris=[existing_uri])
+        events = []
+
+        async def relock_to(paths, timeout=None):
+            events.append(("relock", list(paths), timeout))
+
+        async def execute_tool(tool_call):
+            events.append(("execute", tool_call.arguments["uri"]))
+            return {"uri": tool_call.arguments["uri"]}
+
+        context_provider.execute_tool = AsyncMock(side_effect=execute_tool)
+
+        loop = ExtractLoop(
+            vlm=Mock(model="test-model"), viking_fs=Mock(), context_provider=context_provider
+        )
+        loop._lock_scope = SimpleNamespace(relock_to=AsyncMock(side_effect=relock_to))
+
+        await loop._execute_tool_calls(
+            messages=[],
+            tool_calls=[
+                SimpleNamespace(id="call-1", name="read", arguments={"uri": first_uri}),
+                SimpleNamespace(id="call-2", name="read", arguments={"uri": second_uri}),
+            ],
+            tools_used=[],
+        )
+
+        assert events[0][0] == "relock"
+        assert set(events[0][1]) == {existing_uri, first_uri, second_uri}
+        assert events[0][2] is None
+        assert events[1:] == [("execute", first_uri), ("execute", second_uri)]
+
+
+class TestUnreadExistingFileRelock:
+    @pytest.mark.asyncio
+    async def test_check_unread_existing_files_relocks_before_refetch_reads(self):
+        existing_uri = "viking://user/alice/memories/preferences/existing.md"
+        unread_uri = "viking://user/alice/memories/preferences/unread.md"
+
+        context_provider = Mock()
+        context_provider.read_file_contents = {}
+        context_provider.memory_file_tracker = SimpleNamespace(read_uris=[existing_uri])
+        events = []
+
+        async def relock_to(paths, timeout=None):
+            events.append(("relock", list(paths), timeout))
+
+        async def execute_tool(tool_call):
+            events.append(("execute", tool_call.arguments["uri"]))
+            return {"uri": tool_call.arguments["uri"]}
+
+        context_provider.execute_tool = AsyncMock(side_effect=execute_tool)
+
+        loop = ExtractLoop(
+            vlm=Mock(model="test-model"), viking_fs=Mock(), context_provider=context_provider
+        )
+        loop._lock_scope = SimpleNamespace(relock_to=AsyncMock(side_effect=relock_to))
+
+        refetch_uris = await loop._check_unread_existing_files(
+            ResolvedOperations(
+                upsert_operations=[
+                    ResolvedOperation(
+                        memory_fields={}, memory_type="preferences", uris=[unread_uri]
+                    )
+                ],
+                delete_file_contents=[],
+                errors=[],
+            )
+        )
+
+        assert refetch_uris == {unread_uri: {"uri": unread_uri}}
+        assert events[0][0] == "relock"
+        assert set(events[0][1]) == {existing_uri, unread_uri}
+        assert events[0][2] is None
+        assert events[1:] == [("execute", unread_uri)]

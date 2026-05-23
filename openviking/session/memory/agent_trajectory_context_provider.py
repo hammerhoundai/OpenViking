@@ -36,6 +36,7 @@ class AgentTrajectoryContextProvider(SessionExtractContextProvider):
         "_extract_context",
         "_isolation_handler",
         "_read_file_contents",
+        "_memory_file_tracker",
         "_ctx",
         "_viking_fs",
         "_transaction_handle",
