@@ -560,6 +560,21 @@ The final output of the model must strictly follow the JSON Schema format shown 
             return
         self._lock_scope = LockScope(get_lock_manager(), self._transaction_handle)
 
+    def _normalize_lock_targets(self, targets: Iterable[str]) -> list[str]:
+        normalized_targets = []
+        seen_targets = set()
+        for target in targets or []:
+            normalized = str(target or "").strip()
+            if not normalized:
+                continue
+            if normalized.startswith("viking://") and self.viking_fs is not None:
+                normalized = self.viking_fs._uri_to_path(normalized, ctx=self.ctx)
+            if not normalized or normalized in seen_targets:
+                continue
+            seen_targets.add(normalized)
+            normalized_targets.append(normalized)
+        return normalized_targets
+
     async def _relock_for_read_uris(self, read_uris: Iterable[str]) -> None:
         if self._lock_scope is None:
             return
@@ -567,16 +582,11 @@ The final output of the model must strictly follow the JSON Schema format shown 
         tracked_read_uris = getattr(
             getattr(self.context_provider, "memory_file_tracker", None), "read_uris", []
         )
-        desired_read_uris = []
-        seen_uris = set()
-        for uri in [*(tracked_read_uris or []), *(read_uris or [])]:
-            normalized = str(uri or "").strip()
-            if not normalized or normalized in seen_uris:
-                continue
-            seen_uris.add(normalized)
-            desired_read_uris.append(normalized)
-        if desired_read_uris:
-            await self._lock_scope.relock_to(desired_read_uris, timeout=None)
+        desired_read_paths = self._normalize_lock_targets(
+            [*(tracked_read_uris or []), *(read_uris or [])]
+        )
+        if desired_read_paths:
+            await self._lock_scope.relock_to(desired_read_paths, timeout=None)
 
     async def _relock_for_final_operations(self, operations: ResolvedOperations) -> None:
         if self._lock_scope is None:
@@ -610,8 +620,9 @@ The final output of the model must strictly follow the JSON Schema format shown 
             seen_uris.add(normalized)
             desired_uris.append(normalized)
 
-        if desired_uris:
-            await self._lock_scope.relock_to(desired_uris, timeout=None)
+        desired_paths = self._normalize_lock_targets(desired_uris)
+        if desired_paths:
+            await self._lock_scope.relock_to(desired_paths, timeout=None)
 
     @tracer("extract_loop.execute_tool_calls")
     async def _execute_tool_calls(self, messages, tool_calls, tools_used) -> bool:

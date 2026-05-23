@@ -13,7 +13,7 @@ This test simulates the complete memory extraction workflow:
 
 import logging
 from typing import Any, Dict, List, Tuple
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -477,6 +477,39 @@ def create_update_conversation() -> List[Message]:
     messages.append(msg3)
 
     return messages
+
+
+@pytest.mark.asyncio
+async def test_relock_for_read_uris_converts_memory_uris_to_agfs_paths():
+    ctx = RequestContext(user=UserIdentifier("acme", "alice", "bot"), role=Role.USER)
+    tracker = MagicMock()
+    tracker.read_uris = ["viking://agent/conv-41/memories/soul.md"]
+    context_provider = MagicMock()
+    context_provider.memory_file_tracker = tracker
+    viking_fs = MagicMock()
+    viking_fs._uri_to_path.side_effect = lambda uri, ctx=None: {
+        "viking://agent/conv-41/memories/soul.md": "/local/acme/agent/conv-41/memories/soul.md",
+        "viking://agent/conv-41/memories/profile.md": "/local/acme/agent/conv-41/memories/profile.md",
+    }[uri]
+    relock_to = AsyncMock()
+
+    orchestrator = ExtractLoop(
+        vlm=MagicMock(model="test-model"),
+        viking_fs=viking_fs,
+        ctx=ctx,
+        context_provider=context_provider,
+    )
+    orchestrator._lock_scope = MagicMock(relock_to=relock_to)
+
+    await orchestrator._relock_for_read_uris(["viking://agent/conv-41/memories/profile.md"])
+
+    relock_to.assert_awaited_once_with(
+        [
+            "/local/acme/agent/conv-41/memories/soul.md",
+            "/local/acme/agent/conv-41/memories/profile.md",
+        ],
+        timeout=None,
+    )
 
 
 class TestMemoryExtractorFlow:

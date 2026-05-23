@@ -334,36 +334,6 @@ class TestPathLockBehavior:
         assert ok is True
         assert created_dirs == ["viking://agent/conv-49/memories"]
 
-    async def test_acquire_exact_path_skips_mkdir_for_viking_memory_root(self):
-        lock = PathLockEngine(MagicMock())
-        tx = LockHandle(id="tx-viking-memory-root")
-        target = "viking://agent/conv-49/memories/soul.md"
-        tokens = {}
-
-        async def stat_side_effect(path):
-            raise FileNotFoundError(path)
-
-        async def read_side_effect(path):
-            if path in tokens:
-                return tokens[path]
-            raise FileNotFoundError(path)
-
-        async def write_side_effect(path, content):
-            tokens[path] = content
-
-        lock._async_agfs = MagicMock()
-        lock._async_agfs.stat = AsyncMock(side_effect=stat_side_effect)
-        lock._async_agfs.read = AsyncMock(side_effect=read_side_effect)
-        lock._async_agfs.write = AsyncMock(side_effect=write_side_effect)
-        lock._async_agfs.mkdir = AsyncMock(side_effect=RuntimeError("mount point not found"))
-
-        ok = await lock.acquire_exact_path(target, tx, timeout=0.0)
-
-        assert ok is True
-        lock._async_agfs.mkdir.assert_not_awaited()
-        assert len(tx.locks) == 1
-        assert tx.locks[0].startswith("viking://agent/conv-49/memories/.exact.ovlock.soul.md.")
-
     async def test_exact_blocked_by_ancestor_tree_does_not_create_missing_parent(
         self, agfs_client, test_dir
     ):
