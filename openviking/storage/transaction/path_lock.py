@@ -144,6 +144,20 @@ class PathLockEngine:
             return len(parts) == 2 or (len(parts) == 4 and parts[2] in {"agent", "user"})
         return len(parts) == 1
 
+    def _is_non_creatable_viking_memory_root(self, path: str) -> bool:
+        if not path.startswith("viking://"):
+            return False
+
+        parts = uri_parts(path)
+        if len(parts) == 3 and parts[0] in {"user", "agent"} and parts[2] == "memories":
+            return True
+        return (
+            len(parts) == 5
+            and parts[0] in {"user", "agent"}
+            and parts[2] in {"agent", "user"}
+            and parts[4] == "memories"
+        )
+
     async def _ensure_directory_exists_async(self, path: str):
         """Async variant for lock acquisition paths."""
         path = path.rstrip("/") or "/"
@@ -551,6 +565,7 @@ class PathLockEngine:
             if (
                 lock_path != self._get_lock_path(path)
                 and parent
+                and not self._is_non_creatable_viking_memory_root(parent)
                 and not await self._ensure_directory_exists_async(parent)
             ):
                 logger.warning(f"[EXACT] Failed to ensure parent directory exists: {parent}")
