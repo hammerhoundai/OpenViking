@@ -314,6 +314,26 @@ class TestPathLockBehavior:
 
         await lock.release(tx)
 
+    async def test_ensure_directory_exists_async_stops_at_viking_namespace_root(self):
+        lock = PathLockEngine(MagicMock())
+        created_dirs = []
+
+        async def stat_side_effect(path):
+            raise FileNotFoundError(path)
+
+        async def mkdir_side_effect(path):
+            created_dirs.append(path)
+            return {"message": "created"}
+
+        lock._async_agfs = MagicMock()
+        lock._async_agfs.stat = AsyncMock(side_effect=stat_side_effect)
+        lock._async_agfs.mkdir = AsyncMock(side_effect=mkdir_side_effect)
+
+        ok = await lock._ensure_directory_exists_async("viking://agent/conv-49/memories")
+
+        assert ok is True
+        assert created_dirs == ["viking://agent/conv-49/memories"]
+
     async def test_exact_blocked_by_ancestor_tree_does_not_create_missing_parent(
         self, agfs_client, test_dir
     ):

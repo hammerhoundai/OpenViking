@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
+from openviking.core.namespace import uri_parts
 from openviking.pyagfs import AGFSClient, AsyncAGFSClient
 from openviking.storage.transaction.lock_handle import LockOwner
 from openviking_cli.utils.logger import get_logger
@@ -132,8 +133,22 @@ class PathLockEngine:
             return [primary]
         return [primary, prefixed]
 
+    def _is_non_creatable_viking_root(self, path: str) -> bool:
+        if not path.startswith("viking://"):
+            return False
+
+        parts = uri_parts(path)
+        if not parts:
+            return True
+        if parts[0] in {"user", "agent"}:
+            return len(parts) == 2 or (len(parts) == 4 and parts[2] in {"agent", "user"})
+        return len(parts) == 1
+
     async def _ensure_directory_exists_async(self, path: str):
         """Async variant for lock acquisition paths."""
+        path = path.rstrip("/") or "/"
+        if self._is_non_creatable_viking_root(path):
+            return True
         try:
             await self._async_agfs.stat(path)
         except Exception:
@@ -150,6 +165,13 @@ class PathLockEngine:
 
     def _get_parent_path(self, path: str) -> Optional[str]:
         path = path.rstrip("/")
+        if not path:
+            return None
+        if path.startswith("viking://"):
+            parts = uri_parts(path)
+            if self._is_non_creatable_viking_root(path) or len(parts) <= 1:
+                return None
+            return f"viking://{'/'.join(parts[:-1])}"
         if "/" not in path:
             return None
         parent = path.rsplit("/", 1)[0]
