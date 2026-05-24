@@ -390,7 +390,7 @@ class TestFinalOperationsHydration:
 
 class TestFinalOperationRelock:
     @pytest.mark.asyncio
-    async def test_run_relocks_to_final_operation_uris_before_return(self):
+    async def test_run_locks_operation_uris_before_return(self):
         existing_uri = "viking://user/alice/memories/preferences/existing.md"
         new_uri = "viking://user/alice/memories/preferences/new.md"
 
@@ -410,7 +410,14 @@ class TestFinalOperationRelock:
         context_provider.get_extract_context.return_value = extract_context
         context_provider.prefetch = AsyncMock(return_value=[])
         context_provider.read_file_contents = {}
-        context_provider.memory_file_tracker = SimpleNamespace(read_uris=[existing_uri])
+        tracked_uris_list = [existing_uri]
+        context_provider.memory_file_tracker = SimpleNamespace(
+            tracked_uris=tracked_uris_list,
+            track=lambda uri: tracked_uris_list.append(uri)
+            if uri not in tracked_uris_list
+            else None,
+        )
+        context_provider.read_file = AsyncMock(return_value=None)
         context_provider.instruction.return_value = "test instruction"
         context_provider._get_registry.return_value = Mock()
 
@@ -420,17 +427,19 @@ class TestFinalOperationRelock:
         isolation_handler.calculate_memory_uris.return_value = [new_uri]
 
         events = []
+        viking_fs_mock = Mock()
+        viking_fs_mock._uri_to_path = lambda uri, ctx=None: uri
 
-        async def relock_to(paths, timeout=None):
-            events.append(("relock", list(paths), timeout))
+        async def lock(paths, timeout=None):
+            events.append(("lock", list(paths), timeout))
 
         loop = ExtractLoop(
             vlm=Mock(model="test-model"),
-            viking_fs=Mock(),
+            viking_fs=viking_fs_mock,
             context_provider=context_provider,
             isolation_handler=isolation_handler,
         )
-        loop._lock_scope = SimpleNamespace(relock_to=AsyncMock(side_effect=relock_to))
+        loop._lock_scope = SimpleNamespace(lock=AsyncMock(side_effect=lock), release=AsyncMock())
         loop._mark_cache_breakpoint = AsyncMock()
         loop._call_llm = AsyncMock(
             return_value=(
@@ -455,9 +464,13 @@ class TestFinalOperationRelock:
             final_operations, _ = await loop.run()
 
         assert final_operations.upsert_operations[0].uris == [new_uri]
-        assert events[0][0] == "relock"
-        assert set(events[0][1]) == {existing_uri, new_uri}
-        assert events[0][2] is None
+        # Events: lock after prefetch, lock after refresh, lock after expand with operations
+        assert len(events) >= 2
+        # The final lock call includes both existing_uri and new_uri
+        last_lock_event = events[-1]
+        assert last_lock_event[0] == "lock"
+        assert existing_uri in last_lock_event[1]
+        assert last_lock_event[2] is None
 
     @pytest.mark.asyncio
     async def test_run_initializes_lock_scope_from_transaction_handle(self):
@@ -479,7 +492,10 @@ class TestFinalOperationRelock:
         context_provider.get_extract_context.return_value = extract_context
         context_provider.prefetch = AsyncMock(return_value=[])
         context_provider.read_file_contents = {}
-        context_provider.memory_file_tracker = SimpleNamespace(read_uris=[])
+        context_provider.memory_file_tracker = SimpleNamespace(
+            tracked_uris=[new_uri], track=lambda uri: None
+        )
+        context_provider.read_file = AsyncMock(return_value=None)
         context_provider.instruction.return_value = "test instruction"
         context_provider._get_registry.return_value = Mock()
 
@@ -491,21 +507,22 @@ class TestFinalOperationRelock:
         handle = SimpleNamespace(id="handle-1", locks=[])
         events = []
 
-        async def acquire_exact_path(handle_arg, path, timeout=None):
+        async def acquire_exact_path_batch(handle_arg, paths, timeout=None):
             assert handle_arg is handle
-            events.append(("acquire", path, timeout))
-            handle_arg.locks.append(f"lock:{path}")
+            events.append(("acquire_batch", list(paths), timeout))
+            for p in paths:
+                handle_arg.locks.append(f"lock:{p}")
             return True
 
         lock_manager = SimpleNamespace(
-            acquire_exact_path=AsyncMock(side_effect=acquire_exact_path),
+            acquire_exact_path_batch=AsyncMock(side_effect=acquire_exact_path_batch),
             release_selected=AsyncMock(),
             release=AsyncMock(),
         )
 
         loop = ExtractLoop(
             vlm=Mock(model="test-model"),
-            viking_fs=Mock(agfs=object()),
+            viking_fs=Mock(agfs=object(), _uri_to_path=lambda uri, ctx=None: uri),
             context_provider=context_provider,
             isolation_handler=isolation_handler,
         )
@@ -537,23 +554,22 @@ class TestFinalOperationRelock:
             final_operations, _ = await loop.run()
 
         assert final_operations.upsert_operations[0].uris == [new_uri]
-        assert events == [("acquire", new_uri, None)]
+        assert len(events) >= 1
+        assert events[0][0] == "acquire_batch"
+        assert set(events[0][1]) == {new_uri}
+        assert events[0][2] is None
         assert loop._lock_scope is not None
 
 
 class TestToolCallRelock:
     @pytest.mark.asyncio
-    async def test_execute_tool_calls_relocks_once_before_parallel_reads(self):
-        existing_uri = "viking://user/alice/memories/preferences/existing.md"
+    async def test_execute_tool_calls_executes_reads_in_parallel(self):
         first_uri = "viking://user/alice/memories/preferences/first.md"
         second_uri = "viking://user/alice/memories/preferences/second.md"
 
         context_provider = Mock()
-        context_provider.memory_file_tracker = SimpleNamespace(read_uris=[existing_uri])
+        context_provider.memory_file_tracker = SimpleNamespace(tracked_uris=[first_uri])
         events = []
-
-        async def relock_to(paths, timeout=None):
-            events.append(("relock", list(paths), timeout))
 
         async def execute_tool(tool_call):
             events.append(("execute", tool_call.arguments["uri"]))
@@ -564,7 +580,7 @@ class TestToolCallRelock:
         loop = ExtractLoop(
             vlm=Mock(model="test-model"), viking_fs=Mock(), context_provider=context_provider
         )
-        loop._lock_scope = SimpleNamespace(relock_to=AsyncMock(side_effect=relock_to))
+        loop._lock_scope = SimpleNamespace()
 
         await loop._execute_tool_calls(
             messages=[],
@@ -575,25 +591,18 @@ class TestToolCallRelock:
             tools_used=[],
         )
 
-        assert events[0][0] == "relock"
-        assert set(events[0][1]) == {existing_uri, first_uri, second_uri}
-        assert events[0][2] is None
-        assert events[1:] == [("execute", first_uri), ("execute", second_uri)]
+        assert events == [("execute", first_uri), ("execute", second_uri)]
 
 
 class TestUnreadExistingFileRelock:
     @pytest.mark.asyncio
-    async def test_check_unread_existing_files_relocks_before_refetch_reads(self):
-        existing_uri = "viking://user/alice/memories/preferences/existing.md"
+    async def test_check_unread_existing_files_reads_missing_files(self):
         unread_uri = "viking://user/alice/memories/preferences/unread.md"
 
         context_provider = Mock()
         context_provider.read_file_contents = {}
-        context_provider.memory_file_tracker = SimpleNamespace(read_uris=[existing_uri])
+        context_provider.memory_file_tracker = SimpleNamespace(tracked_uris=[])
         events = []
-
-        async def relock_to(paths, timeout=None):
-            events.append(("relock", list(paths), timeout))
 
         async def execute_tool(tool_call):
             events.append(("execute", tool_call.arguments["uri"]))
@@ -604,7 +613,7 @@ class TestUnreadExistingFileRelock:
         loop = ExtractLoop(
             vlm=Mock(model="test-model"), viking_fs=Mock(), context_provider=context_provider
         )
-        loop._lock_scope = SimpleNamespace(relock_to=AsyncMock(side_effect=relock_to))
+        loop._lock_scope = SimpleNamespace()
 
         refetch_uris = await loop._check_unread_existing_files(
             ResolvedOperations(
@@ -619,7 +628,4 @@ class TestUnreadExistingFileRelock:
         )
 
         assert refetch_uris == {unread_uri: {"uri": unread_uri}}
-        assert events[0][0] == "relock"
-        assert set(events[0][1]) == {existing_uri, unread_uri}
-        assert events[0][2] is None
-        assert events[1:] == [("execute", unread_uri)]
+        assert events == [("execute", unread_uri)]

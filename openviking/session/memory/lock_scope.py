@@ -35,6 +35,20 @@ class LockScope:
             return []
         return list(self._lock_paths_by_target.get(normalized, []))
 
+    async def lock(self, target_paths: Iterable[str], timeout: Optional[float] = None) -> None:
+        desired_paths = self._normalize_target_paths(target_paths)
+        if not desired_paths:
+            return
+        success = await self._lock_manager.acquire_exact_path_batch(
+            self._handle,
+            desired_paths,
+            timeout=timeout,
+        )
+        if not success:
+            raise RuntimeError(f"Failed to acquire exact locks for paths: {desired_paths}")
+        self._target_paths = desired_paths
+        self._lock_paths_by_target = {path: [] for path in desired_paths}
+
     async def relock_to(self, target_paths: Iterable[str], timeout: Optional[float] = None) -> None:
         desired_paths = self._normalize_target_paths(target_paths)
         desired_set = set(desired_paths)

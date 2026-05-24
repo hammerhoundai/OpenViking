@@ -217,6 +217,9 @@ The final output of the model must strictly follow the JSON Schema format shown 
         for uri in self.context_provider.read_file_contents:
             self._extract_context.page_id_map.get_page_id(uri)
 
+        # Lock tracked URIs before entering ReAct loop
+        await self._lock_tracked_uris()
+
         while iteration < max_iterations:
             iteration += 1
             tracer.info(f"ReAct iteration {iteration}/{max_iterations}")
@@ -232,6 +235,9 @@ The final output of the model must strictly follow the JSON Schema format shown 
                         "content": self._build_final_operations_instruction(),
                     }
                 )
+
+            # Release lock, re-read all tracked URIs to get latest content, re-lock
+            await self._refresh_locked_content(messages)
 
             # Call LLM with tools - model decides: tool calls OR final operations
             pretty_print_messages(messages)
@@ -310,7 +316,15 @@ The final output of the model must strictly follow the JSON Schema format shown 
             else:
                 raise RuntimeError("ReAct loop completed but no operations generated")
 
-        await self._relock_for_final_operations(final_operations)
+        # Expand lock to cover all operation URIs (write + delete) before updater runs
+        operation_uris = self._collect_operation_uris(final_operations)
+        if operation_uris:
+            tracker = getattr(self.context_provider, "memory_file_tracker", None)
+            if tracker:
+                for uri in operation_uris:
+                    tracker.track(uri)
+            await self._lock_tracked_uris()
+
         tracer.info(f"final_operations={final_operations.model_dump_json(indent=4)}")
 
         # Resolve links after the loop completes using the URIs already bound in resolve_operations().
@@ -560,6 +574,20 @@ The final output of the model must strictly follow the JSON Schema format shown 
             return
         self._lock_scope = LockScope(get_lock_manager(), self._transaction_handle)
 
+    def _get_tracked_target_paths(self) -> list[str]:
+        """Return all tracked URIs as normalized AGFS paths."""
+        tracker = getattr(self.context_provider, "memory_file_tracker", None)
+        if tracker is None:
+            return []
+        return self._normalize_lock_targets(tracker.tracked_uris)
+
+    async def _lock_tracked_uris(self) -> None:
+        if self._lock_scope is None:
+            return
+        paths = self._get_tracked_target_paths()
+        if paths:
+            await self._lock_scope.lock(paths, timeout=None)
+
     def _normalize_lock_targets(self, targets: Iterable[str]) -> list[str]:
         normalized_targets = []
         seen_targets = set()
@@ -575,54 +603,194 @@ The final output of the model must strictly follow the JSON Schema format shown 
             normalized_targets.append(normalized)
         return normalized_targets
 
-    async def _relock_for_read_uris(self, read_uris: Iterable[str]) -> None:
+    async def _refresh_locked_content(self, messages: List[Dict[str, Any]]) -> bool:
+        """Release lock, re-read all tracked URIs, update messages, re-lock.
+
+        Moves tool-call pairs for files whose content changed to the end of
+        messages so unchanged pairs stay in place (cache-friendly).
+
+        Returns True if any new URIs were discovered.
+        """
         if self._lock_scope is None:
+            return False
+
+        tracker = getattr(self.context_provider, "memory_file_tracker", None)
+        if tracker is None:
+            return False
+
+        await self._lock_scope.release()
+
+        # Re-search to discover files written by other sessions
+        new_uris = await self._re_search_tracked_directories()
+        if new_uris:
+            for uri in new_uris:
+                tracker.track(uri)
+
+        # Re-read all tracked URIs, only record ones whose content differs from messages
+        old_results_by_uri = self._extract_result_by_uri_from_messages(messages)
+        changed_uris: dict[str, Any] = {}
+        for uri in tracker.tracked_uris:
+            content = await self.context_provider.read_file(uri)
+            if content is None:
+                continue
+            old = old_results_by_uri.get(uri)
+            if old is not None and old == content:
+                # Content unchanged — skip, keep cache-friendly position
+                continue
+            changed_uris[uri] = content
+
+        # Update messages: move changed pairs to the end, append new pairs
+        self._refresh_messages_with_content(messages, changed_uris)
+
+        await self._lock_tracked_uris()
+        return bool(new_uris)
+
+    @staticmethod
+    def _extract_result_by_uri_from_messages(messages: List[Dict[str, Any]]) -> dict[str, Any]:
+        """Scan messages for tool-call pairs and return {uri: result}."""
+        results: dict[str, Any] = {}
+        for msg in messages:
+            if msg.get("role") != "user":
+                continue
+            try:
+                parsed = json.loads(msg.get("content", ""))
+            except (json.JSONDecodeError, TypeError):
+                continue
+            args = parsed.get("args", {})
+            if not isinstance(args, dict):
+                continue
+            uri = str(args.get("uri", "")).strip()
+            if uri:
+                results[uri] = parsed.get("result")
+        return results
+
+    def _refresh_messages_with_content(
+        self, messages: List[Dict[str, Any]], changed_uris: dict[str, Any]
+    ) -> None:
+        """Rebuild tool-call pairs in messages, keeping unchanged pairs in place.
+
+        Only pairs for URIs in *changed_uris* are moved to the end with new
+        content.  Pairs for unchanged URIs stay where they are.  URIs not yet
+        represented in messages are appended at the end.
+        """
+        if not changed_uris:
             return
 
-        tracked_read_uris = getattr(
-            getattr(self.context_provider, "memory_file_tracker", None), "read_uris", []
-        )
-        desired_read_paths = self._normalize_lock_targets(
-            [*(tracked_read_uris or []), *(read_uris or [])]
-        )
-        if desired_read_paths:
-            await self._lock_scope.relock_to(desired_read_paths, timeout=None)
-
-    async def _relock_for_final_operations(self, operations: ResolvedOperations) -> None:
-        if self._lock_scope is None:
-            return
-
-        tracked_read_uris = getattr(
-            getattr(self.context_provider, "memory_file_tracker", None), "read_uris", []
-        )
-        desired_uris = []
-        seen_uris = set()
-
-        for uri in tracked_read_uris or []:
-            normalized = str(uri or "").strip()
-            if not normalized or normalized in seen_uris:
+        # Find existing tool-call pairs by URI
+        existing_pair_indices: dict[str, int] = {}
+        for i, msg in enumerate(messages):
+            if msg.get("role") != "user":
                 continue
-            seen_uris.add(normalized)
-            desired_uris.append(normalized)
-
-        for operation in operations.upsert_operations:
-            for uri in operation.uris:
-                normalized = str(uri or "").strip()
-                if not normalized or normalized in seen_uris:
-                    continue
-                seen_uris.add(normalized)
-                desired_uris.append(normalized)
-
-        for memory_file in operations.delete_file_contents:
-            normalized = str(getattr(memory_file, "uri", "") or "").strip()
-            if not normalized or normalized in seen_uris:
+            try:
+                parsed = json.loads(msg.get("content", ""))
+            except (json.JSONDecodeError, TypeError):
                 continue
-            seen_uris.add(normalized)
-            desired_uris.append(normalized)
+            uri = (parsed.get("args", {}) or {}).get("uri", "")
+            if uri:
+                existing_pair_indices[uri] = i
 
-        desired_paths = self._normalize_lock_targets(desired_uris)
-        if desired_paths:
-            await self._lock_scope.relock_to(desired_paths, timeout=None)
+        # Split handled URIs into: unchanged (leave), changed (move to end), new (append)
+        changed_uris_to_move = set()
+        for uri in changed_uris:
+            if uri in existing_pair_indices:
+                changed_uris_to_move.add(uri)
+
+        # Collect indices to remove (changed pairs)
+        indices_to_remove = sorted(
+            [existing_pair_indices[uri] for uri in changed_uris_to_move], reverse=True
+        )
+        pairs_to_append: list[tuple[str, Any]] = []
+        for i in indices_to_remove:
+            msg = messages.pop(i)
+            uri = (json.loads(msg["content"]).get("args", {}) or {}).get("uri", "")
+            pairs_to_append.append((uri, i))
+        # Reverse so they keep their original relative order when appended
+        pairs_to_append.reverse()
+
+        # Append changed pairs with new content
+        for uri, _ in pairs_to_append:
+            add_tool_call_pair_to_messages(
+                messages=messages,
+                call_id=self._next_call_id(messages),
+                tool_name="read",
+                params={"uri": uri},
+                result=changed_uris[uri],
+            )
+
+        # Append new URIs not previously in messages
+        uris_in_messages = set(existing_pair_indices)
+        new_uris_sorted = sorted([u for u in changed_uris if u not in uris_in_messages])
+        for uri in new_uris_sorted:
+            add_tool_call_pair_to_messages(
+                messages=messages,
+                call_id=self._next_call_id(messages),
+                tool_name="read",
+                params={"uri": uri},
+                result=changed_uris[uri],
+            )
+
+    @staticmethod
+    def _next_call_id(messages: List[Dict[str, Any]]) -> int:
+        return len([m for m in messages if m.get("role") == "user"]) + 1000
+
+    async def _re_search_tracked_directories(self) -> list[str]:
+        """Re-run search in schema directories to discover new files from other sessions."""
+        provider = self.context_provider
+        search_tool = None
+        try:
+            from openviking.session.memory.tools import get_tool
+
+            search_tool = get_tool("search")
+        except Exception:
+            pass
+        if search_tool is None:
+            return []
+
+        schemas = provider.get_memory_schemas(self.ctx)
+        if not schemas:
+            return []
+
+        search_uris = []
+        for schema in schemas:
+            if not schema.directory:
+                continue
+            for dir_path in provider._get_search_directories(schema):
+                search_uris.append(dir_path)
+
+        if not search_uris:
+            return []
+
+        query = provider._build_prefetch_search_query()
+        if not query:
+            query = "conversation"
+
+        try:
+            result = await search_tool.execute(
+                viking_fs=provider._viking_fs,
+                ctx=provider.create_tool_context(search_uris),
+                query=query,
+                limit=provider._prefetch_search_topn,
+            )
+        except Exception:
+            return []
+
+        return provider._extract_uris_from_search_result(result)
+
+    def _collect_operation_uris(self, operations: ResolvedOperations) -> list[str]:
+        uris = []
+        seen = set()
+        for op in operations.upsert_operations:
+            for uri in op.uris:
+                n = str(uri or "").strip()
+                if n and n not in seen:
+                    seen.add(n)
+                    uris.append(n)
+        for mf in operations.delete_file_contents:
+            n = str(getattr(mf, "uri", "") or "").strip()
+            if n and n not in seen:
+                seen.add(n)
+                uris.append(n)
+        return uris
 
     @tracer("extract_loop.execute_tool_calls")
     async def _execute_tool_calls(self, messages, tool_calls, tools_used) -> bool:
@@ -633,12 +801,6 @@ The final output of the model must strictly follow the JSON Schema format shown 
             True if any tool call returned "Unknown tool" error, indicating
             the model should not receive tools in the next iteration.
         """
-        pending_read_uris = [
-            str(tool_call.arguments.get("uri", "")).strip()
-            for tool_call in tool_calls
-            if tool_call.name == "read" and tool_call.arguments is not None
-        ]
-        await self._relock_for_read_uris(pending_read_uris)
 
         # Execute all tool calls in parallel
         async def execute_single_tool_call(idx: int, tool_call):
@@ -802,8 +964,6 @@ The final output of the model must strictly follow the JSON Schema format shown 
                     continue
                 seen_uris.add(normalized)
                 pending_read_uris.append(normalized)
-
-        await self._relock_for_read_uris(pending_read_uris)
 
         for uri in pending_read_uris:
             try:

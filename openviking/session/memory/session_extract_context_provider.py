@@ -402,6 +402,25 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
             return call_id + 1
         return call_id
 
+    def _get_search_directories(self, schema) -> list[str]:
+        """Resolve the search directories for a schema (for re-search during refetch)."""
+        rolescope = self._isolation_handler.get_read_scope() if self._isolation_handler else None
+        if rolescope is None:
+            return []
+        policy = self._ctx.namespace_policy
+        dirs = []
+        for user_id in rolescope.user_ids:
+            for agent_id in rolescope.agent_ids:
+                user_space = to_user_space(policy, user_id, agent_id)
+                agent_space = to_agent_space(policy, user_id, agent_id)
+                dirs.append(
+                    render_template(
+                        schema.directory,
+                        {"user_space": user_space, "agent_space": agent_space},
+                    )
+                )
+        return list(dict.fromkeys(dirs))
+
     async def prefetch(self) -> List[Dict]:
         """
         执行 prefetch - 从会话消息中提取相关记忆上下文

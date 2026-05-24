@@ -480,10 +480,13 @@ def create_update_conversation() -> List[Message]:
 
 
 @pytest.mark.asyncio
-async def test_relock_for_read_uris_converts_memory_uris_to_agfs_paths():
+async def test_lock_tracked_uris_converts_memory_uris_to_agfs_paths():
     ctx = RequestContext(user=UserIdentifier("acme", "alice", "bot"), role=Role.USER)
     tracker = MagicMock()
-    tracker.read_uris = ["viking://agent/conv-41/memories/soul.md"]
+    tracker.tracked_uris = [
+        "viking://agent/conv-41/memories/soul.md",
+        "viking://agent/conv-41/memories/profile.md",
+    ]
     context_provider = MagicMock()
     context_provider.memory_file_tracker = tracker
     viking_fs = MagicMock()
@@ -491,7 +494,7 @@ async def test_relock_for_read_uris_converts_memory_uris_to_agfs_paths():
         "viking://agent/conv-41/memories/soul.md": "/local/acme/agent/conv-41/memories/soul.md",
         "viking://agent/conv-41/memories/profile.md": "/local/acme/agent/conv-41/memories/profile.md",
     }[uri]
-    relock_to = AsyncMock()
+    lock_mock = AsyncMock()
 
     orchestrator = ExtractLoop(
         vlm=MagicMock(model="test-model"),
@@ -499,11 +502,11 @@ async def test_relock_for_read_uris_converts_memory_uris_to_agfs_paths():
         ctx=ctx,
         context_provider=context_provider,
     )
-    orchestrator._lock_scope = MagicMock(relock_to=relock_to)
+    orchestrator._lock_scope = MagicMock(lock=lock_mock)
 
-    await orchestrator._relock_for_read_uris(["viking://agent/conv-41/memories/profile.md"])
+    await orchestrator._lock_tracked_uris()
 
-    relock_to.assert_awaited_once_with(
+    lock_mock.assert_awaited_once_with(
         [
             "/local/acme/agent/conv-41/memories/soul.md",
             "/local/acme/agent/conv-41/memories/profile.md",
