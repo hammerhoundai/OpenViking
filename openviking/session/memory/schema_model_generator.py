@@ -255,14 +255,14 @@ class SchemaModelGenerator:
                 ),
             )
 
-        # Only expose delete_uris when at least one schema supports it.
+        # Only expose delete_page_ids when at least one schema supports it.
         # add_only schemas (e.g. trajectories) never delete existing records,
-        # so excluding this field prevents the LLM from hallucinating fake URIs.
+        # so excluding this field prevents the LLM from hallucinating fake deletes.
         has_deletable_schema = any(mt.operation_mode != "add_only" for mt in enabled_memory_types)
         if has_deletable_schema:
-            field_definitions["delete_uris"] = (
-                List[str],
-                Field(default_factory=list, description="Delete operations as URI strings"),
+            field_definitions["delete_page_ids"] = (
+                List[int],
+                Field(default_factory=list, description="Delete operations as page_id integers"),
             )
 
         # Add links field for link extraction (only when enabled globally)
@@ -302,161 +302,11 @@ class SchemaModelGenerator:
                     else:
                         # Single value (not None)
                         return False
-            return len(self.delete_uris) == 0
-
-        def to_legacy_operations(self) -> Dict[str, Any]:
-            """Convert new per-type structure to legacy write_uris/edit_uris format."""
-            write_uris = []
-            edit_uris = []
-
-            for mt_name in memory_type_fields:
-                value = getattr(self, mt_name, None)
-                if value is None:
-                    continue
-                if isinstance(value, list):
-                    for item in value:
-                        if hasattr(item, "uri") and item.uri:
-                            edit_uris.append(item)
-                        else:
-                            write_uris.append(item)
-                else:
-                    if hasattr(value, "uri") and value.uri:
-                        edit_uris.append(value)
-                    else:
-                        write_uris.append(value)
-
-            return {
-                "write_uris": write_uris,
-                "edit_uris": edit_uris,
-                "delete_uris": self.delete_uris,
-            }
+            return len(self.delete_page_ids) == 0
 
         # Attach methods
         StructuredMemoryOperations.is_empty = is_empty
-        StructuredMemoryOperations.to_legacy_operations = to_legacy_operations
         StructuredMemoryOperations._memory_type_fields = memory_type_fields  # type: ignore
 
         self._operations_model = StructuredMemoryOperations
         return self._operations_model
-
-    def get_memory_data_json_schema(self) -> Dict[str, Any]:
-        """
-        Get the JSON schema just for the flat memory data union.
-
-        Returns:
-            JSON schema for MemoryData
-        """
-        memory_model = self.create_discriminated_union_model()
-        return memory_model.model_json_schema()
-
-
-class SchemaPromptGenerator:
-    """
-    Prompt generator that incorporates schema information into LLM prompts.
-
-    Generates descriptive text about memory types and their fields
-    based on the YAML schema definitions.
-    """
-
-    def __init__(
-        self,
-        schemas: List[MemoryTypeSchema],
-        template_context: Optional[Dict[str, Any]] = None,
-    ):
-        self.schemas = schemas
-        self._template_context = dict(template_context or {})
-        self._template_env = jinja2.Environment(autoescape=False)
-
-    def _render_description(self, description: str) -> str:
-        if not description:
-            return description
-        if "{{" not in description and "{%" not in description and "{#" not in description:
-            return description
-        return self._template_env.from_string(description).render(**self._template_context)
-
-    def generate_type_descriptions(self) -> str:
-        """
-        Generate descriptions of all memory types.
-
-        Returns:
-            Formatted string with all memory type descriptions
-        """
-        lines = ["## Available Memory Types"]
-
-        for mt in self.schemas:
-            lines.append(f"\n### {mt.memory_type}")
-            lines.append(f"{self._render_description(mt.description)}")
-
-            # Add URI format information
-            if mt.directory or mt.filename_template:
-                lines.append("\n**URI Format:**")
-                if mt.directory and mt.filename_template:
-                    lines.append(f"- URI: `{mt.directory}/{mt.filename_template}`")
-                elif mt.directory:
-                    lines.append(f"- Directory: `{mt.directory}`")
-                elif mt.filename_template:
-                    lines.append(f"- Filename: `{mt.filename_template}`")
-
-                # Add variable substitution info
-                lines.append("\n**Variable Substitution:**")
-                lines.append("- `{{ user_space }}` → 'default'")
-                lines.append("- `{{ agent_space }}` → 'default'")
-                if mt.fields:
-                    for field in mt.fields:
-                        lines.append(f"- `{{ {field.name} }}` → use value from fields")
-
-            if mt.fields:
-                lines.append("\n**Fields:**")
-                for field in mt.fields:
-                    lines.append(
-                        f"- `{field.name}` ({field.field_type.value}): {self._render_description(field.description)}"
-                    )
-
-        return "\n".join(lines)
-
-    def generate_field_descriptions(self, memory_type: str) -> Optional[str]:
-        """
-        Generate descriptions for a specific memory type's fields.
-
-        Args:
-            memory_type: The memory type to describe
-
-        Returns:
-            Formatted string with field descriptions, or None if not found
-        """
-        mt = next((s for s in self.schemas if s.memory_type == memory_type), None)
-        if not mt:
-            return None
-
-        lines = [f"### {mt.memory_type} Fields"]
-        for field in mt.fields:
-            lines.append(f"- `{field.name}`: {self._render_description(field.description)}")
-
-        return "\n".join(lines)
-
-    def get_full_prompt_context(self) -> Dict[str, Any]:
-        """
-        Get the full prompt context including all schema information.
-
-        Returns:
-            Dictionary with all prompt context components
-        """
-        return {
-            "type_descriptions": self.generate_type_descriptions(),
-            "memory_types": [
-                {
-                    "memory_type": mt.memory_type,
-                    "description": mt.description,
-                    "fields": [
-                        {
-                            "name": f.name,
-                            "type": f.field_type.value,
-                            "description": f.description,
-                            "merge_op": f.merge_op.value,
-                        }
-                        for f in mt.fields
-                    ],
-                }
-                for mt in self.schemas
-            ],
-        }

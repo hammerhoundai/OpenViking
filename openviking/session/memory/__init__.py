@@ -24,7 +24,6 @@ from openviking.session.memory.memory_updater import MemoryUpdater, MemoryUpdate
 from openviking.session.memory.merge_op import FieldType, MergeOp
 from openviking.session.memory.schema_model_generator import (
     SchemaModelGenerator,
-    SchemaPromptGenerator,
 )
 from openviking.session.memory.tools import (
     MemoryLsTool,
@@ -57,7 +56,6 @@ __all__ = [
     "MemoryTypeRegistry",
     # Schema models
     "SchemaModelGenerator",
-    "SchemaPromptGenerator",
     # Updater
     "MemoryUpdater",
     "MemoryUpdateResult",

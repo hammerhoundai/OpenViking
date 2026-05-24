@@ -23,7 +23,6 @@ from openviking.session.memory.memory_isolation_handler import MemoryIsolationHa
 from openviking.session.memory.merge_op import MergeOp
 from openviking.session.memory.schema_model_generator import (
     SchemaModelGenerator,
-    SchemaPromptGenerator,
 )
 from openviking.session.memory.tools import (
     MEMORY_TOOLS_REGISTRY,
@@ -88,7 +87,6 @@ class ExtractLoop:
 
         # Schema 生成器（在 run() 中初始化）
         self.schema_model_generator = None
-        self.schema_prompt_generator = None
 
         # 预计算：避免每次迭代重复计算
         self._tool_schemas: Optional[List[Dict[str, Any]]] = None
@@ -125,10 +123,6 @@ class ExtractLoop:
         # 初始化 schema 生成器（使用 schemas 而非 registry）
         output_language = self.context_provider.get_output_language()
         self.schema_model_generator = SchemaModelGenerator(
-            schemas,
-            template_context={"language": output_language},
-        )
-        self.schema_prompt_generator = SchemaPromptGenerator(
             schemas,
             template_context={"language": output_language},
         )
@@ -170,8 +164,6 @@ class ExtractLoop:
         import json
 
         schema_str = json.dumps(json_schema, ensure_ascii=False)
-        type_descriptions = self.schema_prompt_generator.generate_type_descriptions()
-
         messages = []
         page_id_rules = """
 ## Page ID Rules
@@ -192,7 +184,6 @@ class ExtractLoop:
                 "role": "system",
                 "content": f"""
 {self.context_provider.instruction()}
-{type_descriptions}
 {page_id_rules}
 {link_rules}
 ## Read Format Rules
@@ -395,14 +386,14 @@ The final output of the model must strictly follow the JSON Schema format shown 
 
                 upsert_operations.append(resolved_op)
 
-        delete_uris_raw = getattr(operations, "delete_uris", []) or []
-        for uri_str in delete_uris_raw:
-            uri_str = uri_str.strip()
-            if not uri_str:
-                continue
-            old_content = self.context_provider.read_file_contents.get(uri_str)
-            if old_content:
-                delete_file_contents.append(old_content)
+        delete_page_ids_raw = getattr(operations, "delete_page_ids", []) or []
+        for page_id in delete_page_ids_raw:
+            if page_id_map is not None:
+                uri_str = page_id_map.resolve(page_id)
+                if uri_str:
+                    old_content = self.context_provider.read_file_contents.get(uri_str)
+                    if old_content:
+                        delete_file_contents.append(old_content)
 
         raw_links = getattr(operations, "links", None) or []
         resolved = ResolvedOperations(
